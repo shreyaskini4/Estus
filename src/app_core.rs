@@ -6,7 +6,19 @@ use anyhow::Result;
 use chrono::{Local, NaiveDate};
 use serde::{Deserialize, Serialize};
 
-use crate::smart::{SmartError, SmartSnapshot};
+use crate::smart::{DriveInfo, SmartError, SmartSnapshot};
+
+/// Configuration options for an individual drive.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct DriveConfig {
+    pub nickname: Option<String>,
+    #[serde(default = "default_true")]
+    pub enabled: bool,
+}
+
+fn default_true() -> bool {
+    true
+}
 
 /// Application configuration and persistence.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -16,6 +28,8 @@ pub struct Settings {
     pub last_notified_date: Option<NaiveDate>,
     #[serde(default)]
     pub custom_smartctl_path: Option<String>,
+    #[serde(default)]
+    pub drives: std::collections::HashMap<String, DriveConfig>,
 }
 
 impl Default for Settings {
@@ -25,6 +39,7 @@ impl Default for Settings {
             start_with_windows: false,
             last_notified_date: None,
             custom_smartctl_path: None,
+            drives: std::collections::HashMap::new(),
         }
     }
 }
@@ -98,6 +113,10 @@ impl Settings {
 /// Global shared state accessible by UI and background worker threads.
 #[derive(Debug, Clone)]
 pub struct SharedState {
+    pub detected_drives: Vec<DriveInfo>,
+    pub selected_drive_id: Option<String>,
+    pub per_drive_snapshots: std::collections::HashMap<String, SmartSnapshot>,
+    pub per_drive_daily_writes: std::collections::HashMap<String, Vec<(NaiveDate, u64)>>,
     pub latest_smart: Option<SmartSnapshot>,
     pub smart_error: Option<SmartError>,
     pub daily_writes: Vec<(NaiveDate, u64)>,
@@ -109,13 +128,20 @@ pub struct SharedState {
     pub show_window: bool,
     pub should_quit: bool,
     pub resolved_smartctl_path: Option<String>,
+    pub smartctl_version: Option<String>,
     pub last_raw_error: Option<String>,
+    pub last_raw_output: Option<String>,
     pub active_device: Option<String>,
+    pub rescan_requested: bool,
 }
 
 impl SharedState {
     pub fn new(settings: Settings) -> Self {
         Self {
+            detected_drives: Vec::new(),
+            selected_drive_id: None,
+            per_drive_snapshots: std::collections::HashMap::new(),
+            per_drive_daily_writes: std::collections::HashMap::new(),
             latest_smart: None,
             smart_error: None,
             daily_writes: Vec::new(),
@@ -127,8 +153,36 @@ impl SharedState {
             show_window: true,
             should_quit: false,
             resolved_smartctl_path: None,
+            smartctl_version: None,
             last_raw_error: None,
+            last_raw_output: None,
             active_device: None,
+            rescan_requested: false,
+        }
+    }
+
+    pub fn get_selected_drive(&self) -> Option<&DriveInfo> {
+        self.selected_drive_id
+            .as_ref()
+            .and_then(|id| self.detected_drives.iter().find(|d| &d.id == id))
+    }
+
+    pub fn get_selected_snapshot(&self) -> Option<&SmartSnapshot> {
+        if let Some(ref id) = self.selected_drive_id {
+            self.per_drive_snapshots.get(id)
+        } else {
+            self.latest_smart.as_ref()
+        }
+    }
+
+    pub fn get_selected_daily_writes(&self) -> &[(NaiveDate, u64)] {
+        if let Some(ref id) = self.selected_drive_id {
+            self.per_drive_daily_writes
+                .get(id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &self.daily_writes
         }
     }
 }
@@ -153,6 +207,48 @@ pub fn fire_notification(today_gb: f64, threshold_gb: f64) -> Result<()> {
     Ok(())
 }
 
+/// Triggers a notification for a specific drive exceeding its threshold.
+pub fn fire_drive_notification(drive_name: &str, today_gb: f64, threshold_gb: f64) -> Result<()> {
+    notify_rust::Notification::new()
+        .appname("Estus")
+        .summary("SSD Write Alert")
+        .body(&format!(
+            "Today's writes on {} ({:.1} GB) exceeded daily threshold of {:.1} GB.",
+            drive_name, today_gb, threshold_gb
+        ))
+        .show()?;
+    Ok(())
+}
+
+/// Checks if a drive's today writes exceed the threshold, sending at most one notification per day.
+pub fn check_and_send_drive_alert(
+    state: &AppState,
+    _drive_id: &str,
+    drive_name: &str,
+    today_bytes: u64,
+    today_date: NaiveDate,
+) -> Result<bool> {
+    let mut state_guard = state
+        .lock()
+        .map_err(|e| anyhow::anyhow!("State mutex poisoned: {e}"))?;
+
+    let threshold_gb = state_guard.settings.alert_threshold_gb;
+    if crate::analytics::is_daily_threshold_exceeded(today_bytes, threshold_gb)
+        && state_guard.settings.last_notified_date != Some(today_date)
+    {
+        let today_gb = today_bytes as f64 / crate::analytics::BYTES_PER_GB;
+        if let Err(e) = fire_drive_notification(drive_name, today_gb, threshold_gb) {
+            crate::logger::log(&format!("Failed to display notification: {e}"));
+        }
+        state_guard.settings.last_notified_date = Some(today_date);
+        if let Err(e) = state_guard.settings.save() {
+            crate::logger::log(&format!("Failed to save settings with updated notification date: {e}"));
+        }
+        return Ok(true);
+    }
+    Ok(false)
+}
+
 /// Checks if today's writes exceed the configured threshold, sending at most one notification per day.
 pub fn check_and_send_alert(
     state: &AppState,
@@ -168,11 +264,11 @@ pub fn check_and_send_alert(
         && state_guard.settings.last_notified_date != Some(today_date) {
             let today_gb = today_bytes as f64 / crate::analytics::BYTES_PER_GB;
             if let Err(e) = fire_notification(today_gb, threshold_gb) {
-                eprintln!("Failed to display notification: {e}");
+                crate::logger::log(&format!("Failed to display notification: {e}"));
             }
             state_guard.settings.last_notified_date = Some(today_date);
             if let Err(e) = state_guard.settings.save() {
-                eprintln!("Failed to save settings with updated notification date: {e}");
+                crate::logger::log(&format!("Failed to save settings with updated notification date: {e}"));
             }
             return Ok(true);
         }
@@ -191,7 +287,6 @@ pub fn init_tray() -> Result<(tray_icon::TrayIcon, tray_icon::menu::MenuId, tray
     menu.append(&show_item)?;
     menu.append(&quit_item)?;
 
-    // Construct a standard 16x16 icon in memory
     let width = 16u32;
     let height = 16u32;
     let mut rgba = Vec::with_capacity((width * height * 4) as usize);
@@ -260,14 +355,28 @@ pub fn handle_tray_events(
 pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
     let conn = crate::db::init_db()?;
 
-    // Prune records older than 90 days
     if let Err(e) = crate::db::prune_old_records(&conn, 90) {
-        eprintln!("Warning: Failed to prune old database records: {e}");
+        crate::logger::log(&format!("Warning: Failed to prune old database records: {e}"));
     }
 
-    // Pre-populate state from existing database entries
-    let latest_snapshot = crate::db::latest_snapshot(&conn)?;
-    let daily_writes = crate::db::daily_writes(&conn, 30)?;
+    let drives = crate::db::get_drives(&conn)?;
+    let mut per_drive_snaps = std::collections::HashMap::new();
+    let mut per_drive_writes = std::collections::HashMap::new();
+    let mut first_snap = None;
+
+    for drive in &drives {
+        if let Ok(Some(snap)) = crate::db::latest_snapshot(&conn, &drive.id) {
+            if first_snap.is_none() {
+                first_snap = Some(snap.clone());
+            }
+            per_drive_snaps.insert(drive.id.clone(), snap);
+        }
+        if let Ok(daily) = crate::db::daily_writes(&conn, Some(&drive.id), 30) {
+            per_drive_writes.insert(drive.id.clone(), daily);
+        }
+    }
+
+    let daily_writes = crate::db::daily_writes(&conn, None, 30)?;
 
     let now_ts = chrono::Utc::now().timestamp();
     let today = Local::now().date_naive();
@@ -282,9 +391,10 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
     let top_30d = crate::db::top_processes(&conn, now_ts - 30 * 86_400, 10)?;
 
     if let Ok(mut s) = state.lock() {
-        if latest_snapshot.is_some() {
-            s.latest_smart = latest_snapshot;
-        }
+        s.detected_drives = drives;
+        s.per_drive_snapshots = per_drive_snaps;
+        s.per_drive_daily_writes = per_drive_writes;
+        s.latest_smart = first_snap;
         s.daily_writes = daily_writes;
         s.top_processes_today = top_today;
         s.top_processes_7d = top_7d;
@@ -295,53 +405,148 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+/// Executes a complete SMART scan and query cycle for all detected and enabled drives.
+pub fn poll_smart_cycle(state: &AppState) {
+    let (custom_path, drives_config) = if let Ok(s) = state.lock() {
+        (
+            s.settings.custom_smartctl_path.clone(),
+            s.settings.drives.clone(),
+        )
+    } else {
+        (None, std::collections::HashMap::new())
+    };
+
+    let resolved_exe = crate::smart::resolve_smartctl(custom_path.as_deref());
+    let version = resolved_exe.as_ref().and_then(|p| crate::smart::get_smartctl_version(p));
+    let raw_out = crate::smart::get_last_raw_output();
+
+    let exe = match resolved_exe {
+        Some(p) => p,
+        None => {
+            let err = SmartError::SmartctlNotFound(
+                "smartctl was not found in settings, PATH, C:\\Program Files\\smartmontools\\bin, C:\\Program Files (x86)\\smartmontools\\bin, or Windows Registry".to_string(),
+            );
+            if let Ok(mut s) = state.lock() {
+                s.smart_error = Some(err);
+                s.resolved_smartctl_path = None;
+                s.smartctl_version = None;
+                s.last_raw_output = raw_out;
+                s.data_changed = true;
+            }
+            return;
+        }
+    };
+
+    let resolved_path_str = exe.display().to_string();
+
+    match crate::smart::discover_and_query_all_drives(custom_path.as_deref()) {
+        Ok(discovered) => {
+            let conn_res = crate::db::init_db();
+            let today = chrono::Local::now().date_naive();
+            let mut per_drive_snaps = std::collections::HashMap::new();
+            let mut per_drive_writes = std::collections::HashMap::new();
+            let mut active_drives = Vec::new();
+
+            for (mut drive_info, snapshot) in discovered {
+                if let Some(cfg) = drives_config.get(&drive_info.id) {
+                    drive_info.nickname = cfg.nickname.clone();
+                    drive_info.enabled = cfg.enabled;
+                }
+
+                if let Ok(ref conn) = conn_res {
+                    let _ = crate::db::upsert_drive(conn, &drive_info);
+                    if drive_info.enabled {
+                        let _ = crate::db::insert_snapshot(conn, &drive_info.id, &snapshot);
+                        let daily = crate::db::daily_writes(conn, Some(&drive_info.id), 30).unwrap_or_default();
+
+                        let today_bytes = daily
+                            .iter()
+                            .find(|(d, _)| *d == today)
+                            .map(|(_, b)| *b)
+                            .unwrap_or(0);
+
+                        let drive_label = drive_info
+                            .nickname
+                            .as_deref()
+                            .unwrap_or(&drive_info.model);
+                        let _ = check_and_send_drive_alert(
+                            state,
+                            &drive_info.id,
+                            drive_label,
+                            today_bytes,
+                            today,
+                        );
+
+                        per_drive_writes.insert(drive_info.id.clone(), daily);
+                        per_drive_snaps.insert(drive_info.id.clone(), snapshot.clone());
+                    }
+                }
+                active_drives.push(drive_info);
+            }
+
+            let (all_db_drives, aggregated_daily) = if let Ok(ref conn) = conn_res {
+                let d = crate::db::get_drives(conn).unwrap_or_else(|_| active_drives.clone());
+                let agg = crate::db::daily_writes(conn, None, 30).unwrap_or_default();
+                (d, agg)
+            } else {
+                (active_drives, Vec::new())
+            };
+
+            let first_snap = per_drive_snaps.values().next().cloned();
+            let active_dev = all_db_drives.first().map(|d| d.device_path.clone());
+
+            if let Ok(mut s) = state.lock() {
+                s.detected_drives = all_db_drives;
+                s.per_drive_snapshots = per_drive_snaps;
+                s.per_drive_daily_writes = per_drive_writes;
+                s.daily_writes = aggregated_daily;
+                if s.latest_smart.is_none() || first_snap.is_some() {
+                    s.latest_smart = first_snap;
+                }
+                s.smart_error = None;
+                s.resolved_smartctl_path = Some(resolved_path_str);
+                s.smartctl_version = version;
+                s.last_raw_output = crate::smart::get_last_raw_output();
+                s.active_device = active_dev;
+                s.last_raw_error = None;
+                s.data_changed = true;
+            }
+        }
+        Err(err) => {
+            let raw_err = err.to_string();
+            if let Ok(mut s) = state.lock() {
+                s.smart_error = Some(err);
+                s.resolved_smartctl_path = Some(resolved_path_str);
+                s.smartctl_version = version;
+                s.last_raw_output = crate::smart::get_last_raw_output();
+                s.last_raw_error = Some(raw_err);
+                s.data_changed = true;
+            }
+        }
+    }
+}
+
 /// Spawns the SMART Poller thread. Runs immediately, then every 10 minutes.
+/// Listens for manual rescan trigger via `rescan_requested`.
 pub fn spawn_smart_poller(state: AppState) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("estus-smart-poller".to_string())
         .spawn(move || {
             loop {
-                // Poll SMART
-                let custom_path = if let Ok(s) = state.lock() {
-                    s.settings.custom_smartctl_path.clone()
-                } else {
-                    None
-                };
+                poll_smart_cycle(&state);
 
-                match crate::smart::run_smartctl_with_config(custom_path.as_deref(), None) {
-                    Ok((snapshot, resolved_path, active_dev)) => {
-                        if let Ok(conn) = crate::db::init_db() {
-                            let _ = crate::db::insert_snapshot(&conn, &snapshot);
-                        }
-                        if let Ok(mut s) = state.lock() {
-                            s.latest_smart = Some(snapshot);
-                            s.smart_error = None;
-                            s.resolved_smartctl_path = Some(resolved_path);
-                            s.active_device = Some(active_dev);
-                            s.last_raw_error = None;
-                            s.data_changed = true;
-                        }
-                    }
-                    Err(err) => {
-                        let raw_err = err.to_string();
-                        let resolved = crate::smart::get_or_resolve_smartctl_path(custom_path.as_deref())
-                            .map(|p| p.display().to_string());
-                        if let Ok(mut s) = state.lock() {
-                            s.smart_error = Some(err);
-                            s.resolved_smartctl_path = resolved;
-                            s.last_raw_error = Some(raw_err);
-                            s.data_changed = true;
-                        }
-                    }
-                }
-
-                // Sleep for 10 minutes (600s), checking should_quit every 1 second
-                for _ in 0..600 {
-                    if let Ok(s) = state.lock()
-                        && s.should_quit {
+                // Sleep for up to 10 minutes (600s), checking rescan_requested and should_quit every 500ms
+                for _ in 0..1200 {
+                    if let Ok(mut s) = state.lock() {
+                        if s.should_quit {
                             return;
                         }
-                    std::thread::sleep(Duration::from_secs(1));
+                        if s.rescan_requested {
+                            s.rescan_requested = false;
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_millis(500));
                 }
             }
         })
@@ -356,7 +561,6 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
             let mut collector = crate::procs::ProcCollector::new();
 
             loop {
-                // Sleep for 30s in 1s increments, checking should_quit
                 for _ in 0..30 {
                     if let Ok(s) = state.lock()
                         && s.should_quit {
@@ -370,7 +574,6 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
                         return;
                     }
 
-                // Collect process deltas and record to DB
                 let deltas = collector.poll_deltas();
                 let now_ts = chrono::Utc::now().timestamp();
 
@@ -379,8 +582,7 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
                         let _ = crate::db::insert_process_deltas(&conn, now_ts, &deltas);
                     }
 
-                    // Recalculate daily writes and top processes
-                    let daily = crate::db::daily_writes(&conn, 30).unwrap_or_default();
+                    let daily = crate::db::daily_writes(&conn, None, 30).unwrap_or_default();
                     let today = Local::now().date_naive();
                     let today_start_ts = today
                         .and_hms_opt(0, 0, 0)
@@ -395,17 +597,14 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
                     let top_30d =
                         crate::db::top_processes(&conn, now_ts - 30 * 86_400, 10).unwrap_or_default();
 
-                    // Calculate today's total written bytes
                     let today_bytes = daily
                         .iter()
                         .find(|(d, _)| *d == today)
                         .map(|(_, b)| *b)
                         .unwrap_or(0);
 
-                    // Check notification threshold
                     let _ = check_and_send_alert(&state, today_bytes, today);
 
-                    // Refresh state
                     if let Ok(mut s) = state.lock() {
                         s.daily_writes = daily;
                         s.top_processes_today = top_today;
@@ -439,112 +638,125 @@ mod tests {
         assert!((s.alert_threshold_gb - 100.0).abs() < 1e-6);
         assert!(!s.start_with_windows);
         assert_eq!(s.last_notified_date, None);
+        assert_eq!(s.custom_smartctl_path, None);
+        assert!(s.drives.is_empty());
     }
 
     #[test]
     fn test_settings_serialization() {
-        let date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let mut drives = std::collections::HashMap::new();
+        drives.insert(
+            "drive1".to_string(),
+            DriveConfig {
+                nickname: Some("OS SSD".to_string()),
+                enabled: true,
+            },
+        );
         let s = Settings {
-            alert_threshold_gb: 150.5,
+            alert_threshold_gb: 250.0,
             start_with_windows: true,
-            last_notified_date: Some(date),
-            custom_smartctl_path: None,
+            last_notified_date: NaiveDate::from_ymd_opt(2026, 11, 16),
+            custom_smartctl_path: Some(r"C:\bin\smartctl.exe".to_string()),
+            drives,
         };
 
-        let json = serde_json::to_string(&s).expect("Serialization failed");
-        let decoded: Settings = serde_json::from_str(&json).expect("Deserialization failed");
-
-        assert_eq!(s, decoded);
-    }
-
-    #[test]
-    fn test_settings_save_and_load_from_path() {
-        let temp_dir = std::env::temp_dir().join(format!("estus_test_{}", std::process::id()));
-        let file_path = temp_dir.join("test_settings.json");
-
-        let date = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
-        let s = Settings {
-            alert_threshold_gb: 75.0,
-            start_with_windows: true,
-            last_notified_date: Some(date),
-            custom_smartctl_path: None,
-        };
-
-        s.save_to_path(&file_path).expect("Failed to save settings");
-        assert!(file_path.exists());
-
-        let loaded = Settings::load_from_path(&file_path);
+        let json = serde_json::to_string(&s).unwrap();
+        let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, loaded);
-
-        // Cleanup
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn test_settings_load_corrupted_file() {
-        let temp_dir = std::env::temp_dir().join(format!("estus_test_corrupt_{}", std::process::id()));
-        let file_path = temp_dir.join("corrupt_settings.json");
-
-        std::fs::create_dir_all(&temp_dir).unwrap();
-        std::fs::write(&file_path, "not valid json {{{").unwrap();
-
-        let loaded = Settings::load_from_path(&file_path);
-        assert_eq!(loaded, Settings::default());
-
-        let _ = std::fs::remove_dir_all(temp_dir);
-    }
-
-    #[test]
-    fn test_settings_load_nonexistent_file() {
-        let nonexistent = PathBuf::from("Z:\\nonexistent_dir_12345\\settings.json");
-        let loaded = Settings::load_from_path(&nonexistent);
-        assert_eq!(loaded, Settings::default());
+        assert_eq!(loaded.drives.get("drive1").unwrap().nickname, Some("OS SSD".to_string()));
     }
 
     #[test]
     fn test_shared_state_initialization() {
-        let s = Settings {
-            alert_threshold_gb: 80.0,
-            start_with_windows: false,
-            last_notified_date: None,
-            custom_smartctl_path: None,
-        };
-        let state = SharedState::new(s);
+        let settings = Settings::default();
+        let state = SharedState::new(settings.clone());
 
+        assert!(state.detected_drives.is_empty());
+        assert_eq!(state.selected_drive_id, None);
+        assert!(state.per_drive_snapshots.is_empty());
         assert!(state.latest_smart.is_none());
         assert!(state.smart_error.is_none());
         assert!(state.daily_writes.is_empty());
         assert!(state.top_processes_today.is_empty());
         assert!(state.top_processes_7d.is_empty());
         assert!(state.top_processes_30d.is_empty());
+        assert_eq!(state.settings, settings);
         assert!(!state.data_changed);
         assert!(state.show_window);
         assert!(!state.should_quit);
+        assert_eq!(state.resolved_smartctl_path, None);
+        assert_eq!(state.smartctl_version, None);
+        assert_eq!(state.last_raw_error, None);
+        assert_eq!(state.last_raw_output, None);
+        assert_eq!(state.active_device, None);
+        assert!(!state.rescan_requested);
+    }
+
+    #[test]
+    fn test_settings_save_and_load_from_path() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("estus_test_settings.json");
+
+        let s = Settings {
+            alert_threshold_gb: 50.0,
+            start_with_windows: false,
+            custom_smartctl_path: Some("custom_smartctl.exe".to_string()),
+            ..Default::default()
+        };
+
+        s.save_to_path(&path).unwrap();
+        let loaded = Settings::load_from_path(&path);
+        assert_eq!(s, loaded);
+
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_settings_load_nonexistent_file() {
+        let path = PathBuf::from("C:\\definitely_nonexistent_directory_xyz\\settings.json");
+        let loaded = Settings::load_from_path(&path);
+        assert_eq!(loaded, Settings::default());
+    }
+
+    #[test]
+    fn test_settings_load_corrupted_file() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join("estus_corrupted_settings.json");
+
+        std::fs::write(&path, "this is definitely not valid json").unwrap();
+        let loaded = Settings::load_from_path(&path);
+        assert_eq!(loaded, Settings::default());
+
+        let _ = std::fs::remove_file(&path);
     }
 
     #[test]
     fn test_check_and_send_alert_threshold_logic() {
         let settings = Settings {
-            alert_threshold_gb: 50.0,
+            alert_threshold_gb: 10.0,
             start_with_windows: false,
             last_notified_date: None,
             custom_smartctl_path: None,
+            drives: std::collections::HashMap::new(),
         };
         let state = new_app_state(settings);
-        let date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
+        let today = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
 
-        // 40 GB: under threshold -> false
-        let under = check_and_send_alert(&state, 40_000_000_000, date).unwrap();
-        assert!(!under);
+        // 5 GB: below 10 GB threshold -> no alert
+        let res_below = check_and_send_alert(&state, 5_000_000_000, today).unwrap();
+        assert!(!res_below);
         assert_eq!(state.lock().unwrap().settings.last_notified_date, None);
 
-        // 60 GB: over threshold -> true (notified date updated)
-        let over = check_and_send_alert(&state, 60_000_000_000, date).unwrap();
-        assert!(over);
-        assert_eq!(state.lock().unwrap().settings.last_notified_date, Some(date));
+        // 15 GB: exceeds 10 GB threshold -> alert triggered
+        let res_above = check_and_send_alert(&state, 15_000_000_000, today).unwrap();
+        assert!(res_above);
+        assert_eq!(
+            state.lock().unwrap().settings.last_notified_date,
+            Some(today)
+        );
 
-        // Another check on the same day: already notified today -> false
-        let again = check_and_send_alert(&state, 70_000_000_000, date).unwrap();
-        assert!(!again);
+        // Second check on the same day -> should not fire again
+        let res_duplicate = check_and_send_alert(&state, 20_000_000_000, today).unwrap();
+        assert!(!res_duplicate);
     }
 }

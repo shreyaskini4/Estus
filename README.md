@@ -8,13 +8,17 @@ Designed with a focus on efficiency: **single small executable**, **negligible C
 
 ## Features
 
+- **Multi-SSD Monitoring (NVMe & SATA)**: Automatically discovers all installed solid-state drives using `smartctl --scan -j` and identifies them uniquely by `serial + model`. Supports both NVMe health telemetry and SATA SSD wear leveling/LBA written attributes.
+- **Drive Selector & Global View**: Switch seamlessly between individual connected drives (with customizable nicknames) and a consolidated `🌐 [ All drives ]` view aggregating total host writes and daily write volume.
 - **Top SSD Health Metrics**: Real-time view of **Percentage Used (Wear %)**, **Total Host Writes (TB)**, **Writes Today (GB)**, and **Projected Lifespan (Days until 100% wear)**.
-- **30-Day Daily Write Trends**: Interactive bar chart powered by `egui_plot` displaying daily write volume in GB across the last 30 days.
-- **Top Writing Processes**: Identifies which applications are writing the most data to disk, with quick toggles for **Today**, **Last 7 Days**, and **Last 30 Days**.
-- **Configurable Daily Alerts**: Desktop toast notifications (via `notify-rust`) when daily write volume exceeds your configurable threshold (default: 100 GB). Alerts are rate-limited to fire at most once per day.
-- **System Tray Integration**: Minimizes cleanly to the system tray (`tray-icon`) with context menu options (**Show**, **Quit**), ensuring uninterrupted background monitoring without taskbar clutter.
+- **30-Day Daily Write Trends**: Interactive bar chart powered by `egui_plot` displaying daily write volume in GB across the last 30 days per drive or aggregated across all drives.
+- **Top Writing Processes**: Identifies which applications are writing the most data across the system, with quick toggles for **Today**, **Last 7 Days**, and **Last 30 Days**.
+- **Configurable Daily Alerts**: Desktop toast notifications (via `notify-rust`) when daily write volume exceeds your configurable threshold (default: 100 GB). Alerts are evaluated per drive and rate-limited to at most once per day.
+- **System Tray Integration & Silent Window**: Runs natively as a GUI application (`windows_subsystem = "windows"`) with zero command prompt flashing (`CREATE_NO_WINDOW`). Minimizes cleanly to the system tray (`tray-icon`) with context menu options (**Show**, **Quit**).
+- **Diagnostics & Smartctl Resolution**: Multi-stage auto-detection checks custom user paths, system `PATH`, standard `Program Files` installations, and Windows Registry (`HKLM\SOFTWARE\smartmontools`). Built-in Diagnostics panel allows path browsing, re-detection, and inspecting raw outputs.
+- **Rotating File Logger & Crash Hook**: Automatic rotating logging (`<data dir>/estus.log`, rotated at 1 MB) and an uncaught panic hook to capture runtime diagnostics cleanly.
 - **Autostart with Windows**: Native Windows startup registry integration via the `auto-launch` crate.
-- **Embedded SQLite Storage**: Built-in SQLite database using WAL mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) in the user data directory, automatically pruning records older than 90 days.
+- **Embedded SQLite Storage**: Built-in SQLite database using WAL mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) in the user data directory, automatically migrating schemas and pruning process writes older than 90 days.
 - **Ultra-low CPU Usage**: Processes are sampled using `sysinfo` with disk-usage-only polling every 30 seconds. The GUI repaints only on data changes or at most once per second, keeping idle CPU near 0%.
 
 ---
@@ -73,13 +77,15 @@ The application is structured into modular Rust components:
 
 ```
 src/
-├── main.rs       # Application entry point, eframe initialization, tray orchestration
-├── smart.rs      # smartctl subprocess execution, NVMe health log JSON parsing, error types
-├── procs.rs      # Low-overhead sysinfo process disk polling, PID reuse delta calculation
-├── db.rs         # SQLite storage (WAL mode), snapshot & delta persistence, aggregation, pruning
-├── analytics.rs  # Pure mathematical functions for write rates, lifespan, and thresholds
-├── app_core.rs   # Background worker threads, system tray icon, notifications, JSON settings
-└── ui.rs         # egui dark dashboard, 30-day egui_plot bar chart, process table, settings panel
+├── main.rs         # Application entry point, eframe initialization, tray orchestration, panic hook
+├── smart.rs        # smartctl resolution, multi-drive discovery, NVMe & SATA SMART telemetry parsing
+├── procs.rs        # Low-overhead sysinfo process disk polling, PID reuse delta calculation
+├── db.rs           # SQLite storage (WAL mode), drives table, per-drive snapshot & delta persistence
+├── analytics.rs    # Pure mathematical functions for write rates, lifespan, and thresholds
+├── app_core.rs     # Background worker threads, system tray icon, notifications, JSON settings
+├── ui.rs           # egui dashboard, drive selector, 30-day plot, diagnostics panel, settings
+├── logger.rs       # Rotating file logger (<data dir>/estus.log) and crash formatting
+└── process_util.rs # Shared silent subprocess creation with CREATE_NO_WINDOW flag
 ```
 
 ### Core Crates:

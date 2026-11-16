@@ -1,6 +1,10 @@
+#![windows_subsystem = "windows"]
+
 pub mod analytics;
 pub mod app_core;
 pub mod db;
+pub mod logger;
+pub mod process_util;
 pub mod procs;
 pub mod smart;
 pub mod ui;
@@ -8,6 +12,16 @@ pub mod ui;
 use std::sync::Arc;
 
 fn main() -> eframe::Result<()> {
+    // Install panic hook so uncaught panics are captured into estus.log
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |panic_info| {
+        let panic_msg = crate::logger::format_panic_info(panic_info);
+        crate::logger::log(&panic_msg);
+        default_hook(panic_info);
+    }));
+
+    crate::logger::log("Estus starting up");
+
     // 1. Load settings and create shared application state
     let settings = app_core::Settings::load();
     let state = app_core::new_app_state(settings);
@@ -27,7 +41,7 @@ fn main() -> eframe::Result<()> {
         ..Default::default()
     };
 
-    eframe::run_native(
+    let res = eframe::run_native(
         "Estus",
         native_options,
         Box::new(move |cc| {
@@ -63,5 +77,10 @@ fn main() -> eframe::Result<()> {
 
             Ok(Box::new(app))
         }),
-    )
+    );
+
+    if let Err(ref e) = res {
+        crate::logger::log(&format!("eframe::run_native returned error: {e}"));
+    }
+    res
 }
