@@ -48,7 +48,7 @@ fn main() -> eframe::Result<()> {
             let mut app = ui::EstusApp::new(Arc::clone(&state));
 
             if let Some((tray, show_id, quit_id)) = tray_bundle {
-                // Spawn tray event handler thread with egui Context so tray clicks instantly wake UI
+                // Spawn tray event handler thread with egui Context so tray clicks instantly wake and show UI
                 let state_clone = Arc::clone(&state);
                 let ctx_clone = cc.egui_ctx.clone();
                 let show_id_clone = show_id.clone();
@@ -57,17 +57,18 @@ fn main() -> eframe::Result<()> {
                 std::thread::Builder::new()
                     .name("estus-tray-listener".to_string())
                     .spawn(move || loop {
-                        app_core::handle_tray_events(&state_clone, &show_id_clone, &quit_id_clone);
-                        if let Ok(s) = state_clone.lock() {
-                            if s.should_quit {
-                                ctx_clone.request_repaint();
-                                break;
-                            }
-                            if s.show_window {
-                                ctx_clone.request_repaint();
-                            }
+                        let show = app_core::handle_tray_events(&state_clone, &show_id_clone, &quit_id_clone);
+                        if show {
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                            ctx_clone.send_viewport_cmd(egui::ViewportCommand::Focus);
+                            ctx_clone.request_repaint();
                         }
-                        std::thread::sleep(std::time::Duration::from_millis(100));
+                        if let Ok(s) = state_clone.lock()
+                            && s.should_quit {
+                                ctx_clone.send_viewport_cmd(egui::ViewportCommand::Close);
+                                std::process::exit(0);
+                            }
+                        std::thread::sleep(std::time::Duration::from_millis(50));
                     })
                     .expect("Failed to spawn tray event listener thread");
 

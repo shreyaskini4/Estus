@@ -314,41 +314,54 @@ pub fn init_tray() -> Result<(tray_icon::TrayIcon, tray_icon::menu::MenuId, tray
 }
 
 /// Processes incoming tray icon and context menu events.
+/// Returns true if a "Show" event was triggered.
 pub fn handle_tray_events(
     state: &AppState,
     show_id: &tray_icon::menu::MenuId,
     quit_id: &tray_icon::menu::MenuId,
-) {
+) -> bool {
+    let mut show_requested = false;
+
     while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
         if event.id == *show_id {
+            crate::logger::log("Tray menu: Show requested");
             if let Ok(mut s) = state.lock() {
                 s.show_window = true;
             }
-        } else if event.id == *quit_id
-            && let Ok(mut s) = state.lock() {
+            show_requested = true;
+        } else if event.id == *quit_id {
+            crate::logger::log("Tray menu: Quit clicked. Terminating application.");
+            if let Ok(mut s) = state.lock() {
                 s.should_quit = true;
             }
+            std::process::exit(0);
+        }
     }
 
     while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
         match event {
             tray_icon::TrayIconEvent::DoubleClick { .. } => {
+                crate::logger::log("Tray icon double-clicked: showing window");
                 if let Ok(mut s) = state.lock() {
                     s.show_window = true;
                 }
+                show_requested = true;
             }
             tray_icon::TrayIconEvent::Click {
                 button: tray_icon::MouseButton::Left,
-                button_state: tray_icon::MouseButtonState::Up,
                 ..
             } => {
+                crate::logger::log("Tray icon left-clicked: showing window");
                 if let Ok(mut s) = state.lock() {
                     s.show_window = true;
                 }
+                show_requested = true;
             }
             _ => {}
         }
     }
+
+    show_requested
 }
 
 /// Performs startup initialization: prunes old records and pre-loads recent historical metrics from DB.

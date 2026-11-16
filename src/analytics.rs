@@ -3,9 +3,6 @@ use chrono::NaiveDate;
 /// Standard decimal gigabyte: 1,000,000,000 bytes (storage industry standard matching NVMe SMART specifications).
 pub const BYTES_PER_GB: f64 = 1_000_000_000.0;
 
-/// Binary gigabyte (gibibyte): 1,073,741,824 bytes (1024^3).
-pub const BYTES_PER_GIB: f64 = 1_073_741_824.0;
-
 /// Calculate average GB/day over the last 7 days (or up to 7 days if fewer days of data exist).
 ///
 /// Returns 0.0 if `daily_writes` is empty.
@@ -65,6 +62,14 @@ pub fn writes_per_power_on_hour_gb(total_bytes_written: u64, power_on_hours: u64
     }
 
     (total_bytes_written as f64 / BYTES_PER_GB) / (power_on_hours as f64)
+}
+
+/// Returns the lifetime average daily write rate in GB from total lifetime writes and power-on hours.
+///
+/// Uses the physical relation: Daily GB = (Writes per Hour in GB) * 24 hours.
+/// Returns 0.0 if `power_on_hours == 0`.
+pub fn historical_daily_writes_gb(total_bytes_written: u64, power_on_hours: u64) -> f64 {
+    writes_per_power_on_hour_gb(total_bytes_written, power_on_hours) * 24.0
 }
 
 /// Returns true if `today_writes_bytes` in GB strictly exceeds `threshold_gb`.
@@ -213,6 +218,16 @@ mod tests {
         // 0 bytes in 100 hours -> 0.0 GB/hour
         let res_zero = writes_per_power_on_hour_gb(0, 100);
         assert_eq!(res_zero, 0.0);
+    }
+
+    #[test]
+    fn test_historical_daily_writes_gb() {
+        // 240 GB in 24 hours -> 10 GB/hr * 24 = 240 GB/day
+        let res = historical_daily_writes_gb(240 * 1_000_000_000, 24);
+        assert!((res - 240.0).abs() < 1e-6);
+
+        // 0 hours -> 0.0
+        assert_eq!(historical_daily_writes_gb(500_000_000_000, 0), 0.0);
     }
 
     #[test]

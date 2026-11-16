@@ -65,19 +65,25 @@ pub fn format_with_commas(n: u64) -> String {
     out
 }
 
-/// Formats projected lifespan in days and optional approximate years.
+/// Formats projected lifespan in days and approximate years.
+/// Caps extremely long estimates (e.g. > 20 or > 30 years) to realistic hardware wear summaries.
 pub fn format_projected_lifespan(projected: Option<u64>) -> String {
     match projected {
         None => "Indefinite".to_string(),
         Some(0) => "0 days (Depleted)".to_string(),
         Some(days) => {
-            let formatted_days = format_with_commas(days);
-            if days >= 365 {
-                let years = days as f64 / 365.25;
+            let years = days as f64 / 365.25;
+            if years >= 30.0 {
+                "> 30 years (Low wear)".to_string()
+            } else if years >= 20.0 {
+                "> 20 years (Healthy)".to_string()
+            } else if days >= 365 {
+                let formatted_days = format_with_commas(days);
                 format!("{formatted_days} days (~{years:.1} years)")
             } else if days == 1 {
                 "1 day".to_string()
             } else {
+                let formatted_days = format_with_commas(days);
                 format!("{formatted_days} days")
             }
         }
@@ -104,7 +110,6 @@ pub struct SsdWatchApp {
     pub temp_drive_nicknames: std::collections::HashMap<String, String>,
     pub temp_drive_enabled: std::collections::HashMap<String, bool>,
     pub settings_status_msg: Option<(String, bool)>,
-    pub is_refreshing: bool,
     pub _tray: Option<tray_icon::TrayIcon>,
     pub _show_id: Option<tray_icon::menu::MenuId>,
     pub _quit_id: Option<tray_icon::menu::MenuId>,
@@ -131,7 +136,6 @@ impl SsdWatchApp {
             temp_drive_nicknames: std::collections::HashMap::new(),
             temp_drive_enabled: std::collections::HashMap::new(),
             settings_status_msg: None,
-            is_refreshing: false,
             _tray: None,
             _show_id: None,
             _quit_id: None,
@@ -197,7 +201,28 @@ impl eframe::App for SsdWatchApp {
         ui.ctx().set_visuals(egui::Visuals::dark());
         ui.ctx().request_repaint_after(std::time::Duration::from_secs(1));
 
+        // Drain any pending tray events during UI rendering
+        if let (Some(show_id), Some(quit_id)) = (&self._show_id, &self._quit_id) {
+            let show = crate::app_core::handle_tray_events(&self.state, show_id, quit_id);
+            if show {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Focus);
+            }
+        }
+
+        // Check if an exit was requested
+        if let Ok(s) = self.state.lock()
+            && s.should_quit {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
+                std::process::exit(0);
+            }
+
+        // Handle window close: cancel close and hide to system tray unless quitting
         if ui.ctx().input(|i| i.viewport().close_requested()) {
+            if let Ok(s) = self.state.lock()
+                && s.should_quit {
+                    return;
+                }
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(false));
             if let Ok(mut s) = self.state.lock() {
@@ -205,20 +230,10 @@ impl eframe::App for SsdWatchApp {
             }
         }
 
-        let (show_win, should_quit) = if let Ok(s) = self.state.lock() {
-            (s.show_window, s.should_quit)
-        } else {
-            (true, false)
-        };
-
-        if should_quit {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
-            return;
-        }
-
-        if show_win {
-            ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
-        }
+        if let Ok(s) = self.state.lock()
+            && s.show_window {
+                ui.ctx().send_viewport_cmd(egui::ViewportCommand::Visible(true));
+            }
 
         let (
             detected_drives,
@@ -765,7 +780,7 @@ fn render_metric_cards(
         )
     };
 
-    if let Some(drive) = selected_drive {
+    if let Some(_drive) = selected_drive {
         // Specific drive view
         let (pct_str, pct_color, pct_subtext, pct_val) = match selected_snapshot {
             Some(s) => {
@@ -777,10 +792,11 @@ fn render_metric_cards(
                     Color32::from_rgb(244, 67, 54)
                 };
 
-                let subtext = if s.available_spare > 0 {
-                    format!("Available Spare: {}%", s.available_spare)
+                let remaining_life = 100u8.saturating_sub(s.percent_used);
+                let subtext = if s.available_spare > 0 && s.available_spare <= 100 {
+                    format!("Remaining Life: {}% | Spare: {}%", remaining_life, s.available_spare)
                 } else {
-                    format!("Protocol: {}", drive.protocol)
+                    format!("Remaining Life: {}%", remaining_life)
                 };
 
                 (
@@ -806,21 +822,44 @@ fn render_metric_cards(
             None => ("N/A".to_string(), "No readings recorded".to_string()),
         };
 
-        let avg_daily_gb = crate::analytics::average_daily_writes_gb(daily_writes);
-        let avg_daily_bytes = (avg_daily_gb * crate::analytics::BYTES_PER_GB) as u64;
+        let (effective_daily_gb, lifespan_subtext) = match selected_snapshot {
+            Some(s) => {
+                let hist_gb = crate::analytics::historical_daily_writes_gb(s.host_bytes_written(), s.power_on_hours);
+                if daily_writes.len() >= 7 {
+                    let avg7 = crate::analytics::average_daily_writes_gb(daily_writes);
+                    (avg7.max(0.1), format!("Rate: {:.1} GB/day (7d avg)", avg7))
+                } else if hist_gb > 0.0 {
+                    (hist_gb, format!("Rate: {:.1} GB/day (lifetime avg)", hist_gb))
+                } else {
+                    let avg7 = crate::analytics::average_daily_writes_gb(daily_writes);
+                    let sub = if avg7 > 0.0 {
+                        format!("Rate: {:.1} GB/day (7d avg)", avg7)
+                    } else {
+                        "Awaiting write rate baseline".to_string()
+                    };
+                    (avg7, sub)
+                }
+            }
+            None => {
+                let avg7 = crate::analytics::average_daily_writes_gb(daily_writes);
+                let sub = if avg7 > 0.0 {
+                    format!("Rate: {:.1} GB/day (7d avg)", avg7)
+                } else {
+                    "Awaiting write rate baseline".to_string()
+                };
+                (avg7, sub)
+            }
+        };
+
+        let effective_daily_bytes = (effective_daily_gb * crate::analytics::BYTES_PER_GB) as u64;
         let projected_days = selected_snapshot.and_then(|s| {
             crate::analytics::projected_days_to_depletion(
                 s.percent_used,
-                avg_daily_bytes,
+                effective_daily_bytes,
                 s.host_bytes_written(),
             )
         });
         let lifespan_str = format_projected_lifespan(projected_days);
-        let lifespan_subtext = if avg_daily_gb > 0.0 {
-            format!("Rate: {:.1} GB/day (7d avg)", avg_daily_gb)
-        } else {
-            "Awaiting write rate baseline".to_string()
-        };
 
         ui.columns(4, |cols| {
             render_metric_card(
@@ -869,10 +908,11 @@ fn render_metric_cards(
             } else {
                 Color32::from_rgb(244, 67, 54)
             };
+            let avg_remaining = 100.0 - avg_wear;
             (
                 format!("{max_wear}% (max)"),
                 color,
-                format!("Avg: {avg_wear:.0}% across {} drives", per_drive_snapshots.len()),
+                format!("Remaining: {:.0}% avg ({} drives)", avg_remaining, per_drive_snapshots.len()),
                 Some(max_wear as f32 / 100.0),
             )
         } else {
@@ -897,13 +937,25 @@ fn render_metric_cards(
         let host_writes_subtext = format!("Total across {} monitored drives", per_drive_snapshots.len());
 
         let avg_daily_gb = crate::analytics::average_daily_writes_gb(daily_writes);
-        let avg_daily_bytes = (avg_daily_gb * crate::analytics::BYTES_PER_GB) as u64;
-
         let mut min_projected: Option<u64> = None;
+        let mut total_effective_rate_gb = 0.0;
+        let num_drives = per_drive_snapshots.len().max(1) as f64;
+
         for snap in per_drive_snapshots.values() {
+            let hist_gb = crate::analytics::historical_daily_writes_gb(snap.host_bytes_written(), snap.power_on_hours);
+            let drive_rate_gb = if daily_writes.len() >= 7 {
+                (avg_daily_gb / num_drives).max(0.1)
+            } else if hist_gb > 0.0 {
+                hist_gb
+            } else {
+                avg_daily_gb / num_drives
+            };
+            total_effective_rate_gb += drive_rate_gb;
+            let drive_daily_bytes = (drive_rate_gb * crate::analytics::BYTES_PER_GB) as u64;
+
             if let Some(days) = crate::analytics::projected_days_to_depletion(
                 snap.percent_used,
-                avg_daily_bytes / per_drive_snapshots.len().max(1) as u64,
+                drive_daily_bytes,
                 snap.host_bytes_written(),
             ) {
                 min_projected = Some(match min_projected {
@@ -913,8 +965,12 @@ fn render_metric_cards(
             }
         }
         let lifespan_str = format_projected_lifespan(min_projected);
-        let lifespan_subtext = if avg_daily_gb > 0.0 {
-            format!("Total rate: {:.1} GB/day (7d avg)", avg_daily_gb)
+        let lifespan_subtext = if total_effective_rate_gb > 0.0 {
+            if daily_writes.len() >= 7 {
+                format!("Total rate: {:.1} GB/day (7d avg)", total_effective_rate_gb)
+            } else {
+                format!("Total rate: {:.1} GB/day (lifetime avg)", total_effective_rate_gb)
+            }
         } else {
             "Awaiting write rate baseline".to_string()
         };
@@ -1416,6 +1472,14 @@ mod tests {
             format_projected_lifespan(Some(3650)),
             "3,650 days (~10.0 years)"
         );
+        assert_eq!(
+            format_projected_lifespan(Some(8000)),
+            "> 20 years (Healthy)"
+        );
+        assert_eq!(
+            format_projected_lifespan(Some(15000)),
+            "> 30 years (Low wear)"
+        );
     }
 
     #[test]
@@ -1451,6 +1515,5 @@ mod tests {
         assert!((app.temp_alert_threshold - 75.0).abs() < 1e-6);
         assert!(app.temp_start_with_windows);
         assert_eq!(app.settings_status_msg, None);
-        assert!(!app.is_refreshing);
     }
 }
