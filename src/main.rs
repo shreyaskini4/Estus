@@ -21,17 +21,17 @@ fn main() -> eframe::Result<()> {
     // 4. Configure native window options
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
-            .with_title("SSD Watch")
+            .with_title("Estus")
             .with_inner_size([920.0, 740.0])
             .with_min_inner_size([780.0, 520.0]),
         ..Default::default()
     };
 
     eframe::run_native(
-        "SSD Watch",
+        "Estus",
         native_options,
         Box::new(move |cc| {
-            let mut app = ui::SsdWatchApp::new(Arc::clone(&state));
+            let mut app = ui::EstusApp::new(Arc::clone(&state));
 
             if let Some((tray, show_id, quit_id)) = tray_bundle {
                 // Spawn tray event handler thread with egui Context so tray clicks instantly wake UI
@@ -41,7 +41,7 @@ fn main() -> eframe::Result<()> {
                 let quit_id_clone = quit_id.clone();
 
                 std::thread::Builder::new()
-                    .name("ssd-watch-tray-listener".to_string())
+                    .name("estus-tray-listener".to_string())
                     .spawn(move || loop {
                         app_core::handle_tray_events(&state_clone, &show_id_clone, &quit_id_clone);
                         if let Ok(s) = state_clone.lock() {

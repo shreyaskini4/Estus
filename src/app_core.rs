@@ -28,7 +28,7 @@ impl Default for Settings {
 
 /// Returns the path to `settings.json` within the system config directory.
 pub fn settings_path() -> Option<PathBuf> {
-    directories::ProjectDirs::from("com", "ssdwatch", "SSDWatch")
+    directories::ProjectDirs::from("com", "estus", "Estus")
         .map(|dirs| dirs.config_dir().join("settings.json"))
 }
 
@@ -79,7 +79,7 @@ impl Settings {
             .ok_or_else(|| anyhow::anyhow!("Invalid executable path"))?;
 
         let auto = auto_launch::AutoLaunchBuilder::new()
-            .set_app_name("SSDWatch")
+            .set_app_name("Estus")
             .set_app_path(app_path)
             .build()?;
 
@@ -134,7 +134,7 @@ pub fn new_app_state(settings: Settings) -> AppState {
 /// Triggers a Windows toast notification when daily write threshold is exceeded.
 pub fn fire_notification(today_gb: f64, threshold_gb: f64) -> Result<()> {
     notify_rust::Notification::new()
-        .appname("SSD Watch")
+        .appname("Estus")
         .summary("SSD Write Alert")
         .body(&format!(
             "Today's SSD writes ({:.1} GB) exceeded your daily threshold of {:.1} GB.",
@@ -202,7 +202,7 @@ pub fn init_tray() -> Result<(tray_icon::TrayIcon, tray_icon::menu::MenuId, tray
 
     let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
-        .with_tooltip("SSD Watch")
+        .with_tooltip("Estus")
         .with_icon(icon)
         .build()?;
 
@@ -289,7 +289,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
 /// Spawns the SMART Poller thread. Runs immediately, then every 10 minutes.
 pub fn spawn_smart_poller(state: AppState) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("ssd-watch-smart-poller".to_string())
+        .name("estus-smart-poller".to_string())
         .spawn(move || {
             loop {
                 // Poll SMART
@@ -328,7 +328,7 @@ pub fn spawn_smart_poller(state: AppState) -> std::thread::JoinHandle<()> {
 /// Spawns the Process Poller thread. Runs every 30 seconds.
 pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
-        .name("ssd-watch-procs-poller".to_string())
+        .name("estus-procs-poller".to_string())
         .spawn(move || {
             let mut collector = crate::procs::ProcCollector::new();
 
@@ -435,7 +435,7 @@ mod tests {
 
     #[test]
     fn test_settings_save_and_load_from_path() {
-        let temp_dir = std::env::temp_dir().join(format!("ssdwatch_test_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("estus_test_{}", std::process::id()));
         let file_path = temp_dir.join("test_settings.json");
 
         let date = NaiveDate::from_ymd_opt(2026, 5, 20).unwrap();
@@ -457,7 +457,7 @@ mod tests {
 
     #[test]
     fn test_settings_load_corrupted_file() {
-        let temp_dir = std::env::temp_dir().join(format!("ssdwatch_test_corrupt_{}", std::process::id()));
+        let temp_dir = std::env::temp_dir().join(format!("estus_test_corrupt_{}", std::process::id()));
         let file_path = temp_dir.join("corrupt_settings.json");
 
         std::fs::create_dir_all(&temp_dir).unwrap();

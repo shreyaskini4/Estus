@@ -92,7 +92,9 @@ pub fn format_percentage(pct: Option<u8>) -> String {
     }
 }
 
-/// The main SSD Watch UI application.
+/// The main Estus UI application.
+pub type EstusApp = SsdWatchApp;
+
 pub struct SsdWatchApp {
     pub state: AppState,
     pub time_filter: TimeFilter,
@@ -281,7 +283,7 @@ impl eframe::App for SsdWatchApp {
 fn render_header(ui: &mut egui::Ui, app: &mut SsdWatchApp) {
     ui.horizontal(|ui| {
         ui.label(
-            RichText::new("SSD Watch")
+            RichText::new("Estus")
                 .size(20.0)
                 .strong()
                 .color(Color32::from_rgb(230, 235, 245)),
@@ -335,7 +337,7 @@ fn render_error_banner(ui: &mut egui::Ui, err: &SmartError) {
                                     .color(Color32::from_rgb(255, 100, 100)),
                             );
                             ui.label(
-                                "Administrator permission required. Right click SSD Watch and select 'Run as Administrator'.",
+                                "Administrator permission required. Right click Estus and select 'Run as Administrator'.",
                             );
                         }
                         other => {

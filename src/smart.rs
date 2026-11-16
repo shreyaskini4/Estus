@@ -44,7 +44,7 @@ impl std::fmt::Display for SmartError {
             ),
             Self::PermissionDenied => write!(
                 f,
-                "Permission denied accessing NVMe SMART data. Please run SSD Watch as Administrator."
+                "Permission denied accessing NVMe SMART data. Please run Estus as Administrator."
             ),
             Self::ParseError(msg) => write!(f, "Failed to parse smartctl output: {msg}"),
             Self::CommandFailed(msg) => write!(f, "smartctl command failed: {msg}"),

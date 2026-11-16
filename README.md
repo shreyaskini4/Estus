@@ -1,4 +1,4 @@
-# SSD Watch
+# Estus
 
 A lightweight, native Windows desktop application written in Rust that monitors and analyzes what is wearing out your NVMe SSD.
 
@@ -116,7 +116,7 @@ cargo build --release
 
 The resulting standalone executable is located at:
 ```
-target/release/ssd-watch.exe
+target/release/estus.exe
 ```
 
 ---

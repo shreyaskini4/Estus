@@ -8,7 +8,7 @@ fn main() {
             ExecutionLevel::AsInvoker
         };
         embed_manifest(
-            new_manifest("SSDWatch")
+            new_manifest("Estus")
                 .requested_execution_level(level)
         ).expect("unable to embed manifest file");
     }

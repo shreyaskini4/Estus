@@ -8,11 +8,11 @@ use crate::smart::SmartSnapshot;
 /// Returns the path to the SQLite database file in the platform-specific data directory.
 /// Ensures the parent directory exists.
 pub fn get_db_path() -> Result<PathBuf> {
-    let proj_dirs = directories::ProjectDirs::from("com", "ssdwatch", "SSDWatch")
+    let proj_dirs = directories::ProjectDirs::from("com", "estus", "Estus")
         .ok_or_else(|| anyhow::anyhow!("Failed to determine project directories"))?;
     let dir = proj_dirs.data_local_dir();
     std::fs::create_dir_all(dir)?;
-    Ok(dir.join("ssd_watch.db"))
+    Ok(dir.join("estus.db"))
 }
 
 /// Initializes database connection using default application path.
@@ -423,7 +423,7 @@ mod tests {
     #[test]
     fn test_get_db_path() -> Result<()> {
         let path = get_db_path()?;
-        assert!(path.ends_with("ssd_watch.db"));
+        assert!(path.ends_with("estus.db"));
         assert!(path.parent().unwrap().exists());
         Ok(())
     }
