@@ -99,11 +99,51 @@ src/
 
 ---
 
-## Building from Source
+## Creating the Executable (.exe)
 
-### Prerequisites
-- [Rust 1.80+](https://rustup.rs/) (MSVC toolchain recommended on Windows)
-- Visual Studio C++ Build Tools
+### 1. Prerequisites
+- **Rust Toolchain**: Install Rust via [rustup.rs](https://rustup.rs/) or PowerShell:
+  ```powershell
+  winget install --id Rustlang.Rustup
+  ```
+  *(Restart your terminal after installation so `cargo` is in your `PATH`)*
+- **C++ Build Tools**: Visual Studio C++ Build Tools (MSVC toolchain).
+- **smartmontools**: Required at runtime to query drive telemetry:
+  ```powershell
+  winget install smartmontools
+  ```
+
+---
+
+### 2. Build the Standalone Release Binary
+Navigate to the project root directory and run:
+
+```powershell
+cargo build --release
+```
+
+Once compilation completes, your standalone executable is ready at:
+```
+target\release\estus.exe
+```
+
+---
+
+### 3. What Makes This Executable Special?
+- **Single Self-Contained Binary**: All dependencies (including SQLite via the bundled feature) are compiled directly into `estus.exe` (~17 MB). No external DLLs, Node.js, Electron, or web runtimes are needed.
+- **Embedded Administrator Manifest**: During release builds, `build.rs` automatically embeds a Windows application manifest requesting `requireAdministrator`. When you launch `estus.exe`, Windows automatically prompts for UAC elevation without requiring you to right-click "Run as administrator".
+- **Zero Console Window (`windows_subsystem`)**: Compiled with native Windows GUI subsystem flags. Double-clicking `estus.exe` launches the application directly into the system tray and dashboard without flashing or leaving a command prompt window open.
+
+---
+
+### 4. Running & Distributing
+- You can move or copy `estus.exe` anywhere on your machine (e.g., `C:\Program Files\Estus\estus.exe` or your Desktop).
+- Double-click `estus.exe` to run. It will minimize to your system tray on window close and continue background monitoring.
+- Diagnostics and execution logs are stored at `%LOCALAPPDATA%\estus\Estus\data\estus.log`.
+
+---
+
+## Development & Verification
 
 ### Run Tests
 ```powershell
@@ -112,17 +152,7 @@ cargo test
 
 ### Run Clippy Linter
 ```powershell
-cargo clippy -- -D warnings
-```
-
-### Build Optimized Release Executable
-```powershell
-cargo build --release
-```
-
-The resulting standalone executable is located at:
-```
-target/release/estus.exe
+cargo clippy --all-targets -- -D warnings
 ```
 
 ---
