@@ -1,0 +1,67 @@
+pub mod analytics;
+pub mod app_core;
+pub mod db;
+pub mod procs;
+pub mod smart;
+pub mod ui;
+
+use std::sync::Arc;
+
+fn main() -> eframe::Result<()> {
+    // 1. Load settings and create shared application state
+    let settings = app_core::Settings::load();
+    let state = app_core::new_app_state(settings);
+
+    // 2. Start background worker threads (SMART poller, procs poller, database pruning)
+    let _threads = app_core::start_background_threads(Arc::clone(&state));
+
+    // 3. Initialize system tray
+    let tray_bundle = app_core::init_tray().ok();
+
+    // 4. Configure native window options
+    let native_options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_title("SSD Watch")
+            .with_inner_size([920.0, 740.0])
+            .with_min_inner_size([780.0, 520.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "SSD Watch",
+        native_options,
+        Box::new(move |cc| {
+            let mut app = ui::SsdWatchApp::new(Arc::clone(&state));
+
+            if let Some((tray, show_id, quit_id)) = tray_bundle {
+                // Spawn tray event handler thread with egui Context so tray clicks instantly wake UI
+                let state_clone = Arc::clone(&state);
+                let ctx_clone = cc.egui_ctx.clone();
+                let show_id_clone = show_id.clone();
+                let quit_id_clone = quit_id.clone();
+
+                std::thread::Builder::new()
+                    .name("ssd-watch-tray-listener".to_string())
+                    .spawn(move || loop {
+                        app_core::handle_tray_events(&state_clone, &show_id_clone, &quit_id_clone);
+                        if let Ok(s) = state_clone.lock() {
+                            if s.should_quit {
+                                ctx_clone.request_repaint();
+                                break;
+                            }
+                            if s.show_window {
+                                ctx_clone.request_repaint();
+                            }
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    })
+                    .expect("Failed to spawn tray event listener thread");
+
+                // Keep tray icon alive in the app instance
+                app.set_tray(tray, show_id, quit_id);
+            }
+
+            Ok(Box::new(app))
+        }),
+    )
+}

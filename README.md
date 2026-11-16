@@ -1,0 +1,126 @@
+# SSD Watch
+
+A lightweight, native Windows desktop application written in Rust that monitors and analyzes what is wearing out your NVMe SSD.
+
+Designed with a focus on efficiency: **single small executable**, **negligible CPU and RAM overhead**, **zero web technology** (no Electron, no WebView, no Chromium).
+
+---
+
+## Features
+
+- **Top SSD Health Metrics**: Real-time view of **Percentage Used (Wear %)**, **Total Host Writes (TB)**, **Writes Today (GB)**, and **Projected Lifespan (Days until 100% wear)**.
+- **30-Day Daily Write Trends**: Interactive bar chart powered by `egui_plot` displaying daily write volume in GB across the last 30 days.
+- **Top Writing Processes**: Identifies which applications are writing the most data to disk, with quick toggles for **Today**, **Last 7 Days**, and **Last 30 Days**.
+- **Configurable Daily Alerts**: Desktop toast notifications (via `notify-rust`) when daily write volume exceeds your configurable threshold (default: 100 GB). Alerts are rate-limited to fire at most once per day.
+- **System Tray Integration**: Minimizes cleanly to the system tray (`tray-icon`) with context menu options (**Show**, **Quit**), ensuring uninterrupted background monitoring without taskbar clutter.
+- **Autostart with Windows**: Native Windows startup registry integration via the `auto-launch` crate.
+- **Embedded SQLite Storage**: Built-in SQLite database using WAL mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) in the user data directory, automatically pruning records older than 90 days.
+- **Ultra-low CPU Usage**: Processes are sampled using `sysinfo` with disk-usage-only polling every 30 seconds. The GUI repaints only on data changes or at most once per second, keeping idle CPU near 0%.
+
+---
+
+## Installation & Setup
+
+### 1. Install `smartmontools`
+SSD Watch uses `smartctl` to read low-level NVMe SMART health metrics. Install it via Windows Package Manager (`winget`):
+
+```powershell
+winget install smartmontools
+```
+
+*Alternatively, download the installer directly from [smartmontools.org](https://www.smartmontools.org/) and ensure `smartctl.exe` is in your system `PATH`.*
+
+### 2. Run as Administrator
+Accessing raw NVMe hardware SMART logs on Windows requires elevated administrator privileges:
+- The release binary includes an **embedded Windows application manifest** that automatically triggers the Windows UAC (User Account Control) prompt requesting administrator rights (`requireAdministrator`).
+- If launching from a terminal or custom shortcut, ensure it is executed from an elevated shell or with "Run as Administrator".
+
+---
+
+## How the Numbers Are Measured
+
+### 1. NVMe SMART Metrics (`smartctl`)
+SSD Watch queries `smartctl -j -a /dev/nvme0` every 10 minutes in the background without spawning console windows (`CREATE_NO_WINDOW` flag):
+- **Data Units Written & Read**: Read directly from the NVMe `nvme_smart_health_information_log`. According to the official NVM Express specification, **1 Data Unit = 1,000 × 512 bytes = 512,000 bytes** (~500 KiB). Total host bytes are calculated as:
+  $$\text{Host Bytes Written} = \text{data\_units\_written} \times 512{,}000$$
+- **Percentage Used**: Vendor-reported drive wear indicator. `0%` indicates a brand-new drive; `100%` indicates that the drive has reached its rated endurance (TBW). Note that reaching 100% does not imply immediate drive failure, but that the manufacturer's endurance warranty threshold has been reached.
+- **Available Spare**: Remaining percentage of reserve flash memory capacity available to replace degraded blocks.
+- **Power-On Hours & Power Cycles**: Drive operational runtime and boot count.
+
+### 2. Per-Process Write Tracking (`sysinfo`)
+- Every 30 seconds, the background thread uses `sysinfo` with minimal refresh flags (`ProcessRefreshKind::nothing().with_disk_usage()`) to read `total_written_bytes` for each running process.
+- **Delta Calculation**: Computes the delta ($\Delta = \text{current} - \text{previous}$).
+- **PID Reuse Handling**: If a process exits and its PID is reused by a new process ($\text{current} < \text{previous}$), the negative delta is ignored and the baseline resets to prevent erroneous spikes.
+- **Aggregation**: Write deltas are grouped and summed by process executable name so multi-threaded or multi-instance applications (such as browsers, code editors, and background sync engines) are accurately represented.
+
+### 3. Analytics & Lifespan Projection
+- **Average Daily Writes**: 7-day rolling average of daily write volume in GB:
+  $$\text{Average GB/Day} = \frac{\sum_{i=1}^{N} \text{Daily Writes}_i}{N} \quad (N \le 7)$$
+- **Projected Days to 100% Wear**:
+  Using the drive's historical wear baseline and recent write velocity:
+  $$\text{Bytes per 1\% Wear} = \frac{\text{Total Host Bytes Written}}{\text{Percentage Used}}$$
+  $$\text{Remaining Wearable Bytes} = (100 - \text{Percentage Used}) \times \text{Bytes per 1\% Wear}$$
+  $$\text{Projected Remaining Days} = \frac{\text{Remaining Wearable Bytes}}{\text{Average Daily Write Rate}}$$
+  *(If the drive is brand new with 0% wear recorded, the projection displays "Indefinite" until wear accumulates a measurable baseline).*
+- **Writes per Power-On Hour**:
+  $$\text{Writes per Hour (GB)} = \frac{\text{Total Host Bytes Written}}{10^9 \times \text{Power-On Hours}}$$
+
+---
+
+## Architecture & Crates
+
+The application is structured into modular Rust components:
+
+```
+src/
+├── main.rs       # Application entry point, eframe initialization, tray orchestration
+├── smart.rs      # smartctl subprocess execution, NVMe health log JSON parsing, error types
+├── procs.rs      # Low-overhead sysinfo process disk polling, PID reuse delta calculation
+├── db.rs         # SQLite storage (WAL mode), snapshot & delta persistence, aggregation, pruning
+├── analytics.rs  # Pure mathematical functions for write rates, lifespan, and thresholds
+├── app_core.rs   # Background worker threads, system tray icon, notifications, JSON settings
+└── ui.rs         # egui dark dashboard, 30-day egui_plot bar chart, process table, settings panel
+```
+
+### Core Crates:
+- **UI & Graphics**: `eframe`, `egui`, `egui_plot`
+- **System Monitoring**: `sysinfo`
+- **Storage**: `rusqlite` (with `"bundled"` feature)
+- **Desktop Integration**: `tray-icon`, `notify-rust`, `auto-launch`
+- **Serialization & Config**: `serde`, `serde_json`, `directories`
+- **Time & Errors**: `chrono`, `anyhow`
+- **Build Manifest**: `embed-manifest` (requests administrator rights on release builds)
+
+---
+
+## Building from Source
+
+### Prerequisites
+- [Rust 1.80+](https://rustup.rs/) (MSVC toolchain recommended on Windows)
+- Visual Studio C++ Build Tools
+
+### Run Tests
+```powershell
+cargo test
+```
+
+### Run Clippy Linter
+```powershell
+cargo clippy -- -D warnings
+```
+
+### Build Optimized Release Executable
+```powershell
+cargo build --release
+```
+
+The resulting standalone executable is located at:
+```
+target/release/ssd-watch.exe
+```
+
+---
+
+## License
+
+MIT OR Apache-2.0
