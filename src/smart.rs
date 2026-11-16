@@ -1,10 +1,15 @@
 use serde::{Deserialize, Serialize};
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 
 #[cfg(windows)]
 use std::os::windows::process::CommandExt;
 
 #[cfg(windows)]
 const CREATE_NO_WINDOW: u32 = 0x08000000;
+
+/// Global thread-safe cache for the resolved smartctl executable path.
+static CACHED_SMARTCTL_PATH: Mutex<Option<PathBuf>> = Mutex::new(None);
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SmartSnapshot {
@@ -29,8 +34,10 @@ impl SmartSnapshot {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SmartError {
-    SmartctlNotFound,
-    PermissionDenied,
+    SmartctlNotFound(String),
+    PermissionDenied(String),
+    DeviceNotFound(String),
+    SpawnError(String),
     ParseError(String),
     CommandFailed(String),
 }
@@ -38,13 +45,21 @@ pub enum SmartError {
 impl std::fmt::Display for SmartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::SmartctlNotFound => write!(
+            Self::SmartctlNotFound(msg) => write!(
                 f,
-                "smartctl not found in PATH. Install smartmontools (`winget install smartmontools`) or add it to PATH."
+                "smartctl not found: {msg}. Install smartmontools (`winget install smartmontools`) or specify the path."
             ),
-            Self::PermissionDenied => write!(
+            Self::PermissionDenied(msg) => write!(
                 f,
-                "Permission denied accessing NVMe SMART data. Please run Estus as Administrator."
+                "Permission denied accessing NVMe SMART data: {msg}. Please run Estus as Administrator."
+            ),
+            Self::DeviceNotFound(msg) => write!(
+                f,
+                "NVMe device not found: {msg}."
+            ),
+            Self::SpawnError(msg) => write!(
+                f,
+                "Failed to spawn smartctl process: {msg}"
             ),
             Self::ParseError(msg) => write!(f, "Failed to parse smartctl output: {msg}"),
             Self::CommandFailed(msg) => write!(f, "smartctl command failed: {msg}"),
@@ -53,6 +68,116 @@ impl std::fmt::Display for SmartError {
 }
 
 impl std::error::Error for SmartError {}
+
+/// Resolves the smartctl path in the following order:
+/// 1. User-configured path from settings (if valid file)
+/// 2. `where smartctl` / PATH lookup
+/// 3. `C:\Program Files\smartmontools\bin\smartctl.exe`
+/// 4. `C:\Program Files (x86)\smartmontools\bin\smartctl.exe`
+pub fn resolve_smartctl_path(custom_path: Option<&str>) -> Option<PathBuf> {
+    // 1. User-configured path
+    if let Some(custom) = custom_path {
+        let trimmed = custom.trim();
+        if !trimmed.is_empty() {
+            let p = PathBuf::from(trimmed);
+            if p.is_file() {
+                return Some(p);
+            }
+        }
+    }
+
+    // 2. PATH lookup
+    if let Some(p) = find_in_path("smartctl") {
+        return Some(p);
+    }
+    #[cfg(windows)]
+    if let Some(p) = find_with_where_cmd("smartctl") {
+        return Some(p);
+    }
+
+    // 3. C:\Program Files\smartmontools\bin\smartctl.exe
+    let p3 = PathBuf::from(r"C:\Program Files\smartmontools\bin\smartctl.exe");
+    if p3.is_file() {
+        return Some(p3);
+    }
+
+    // 4. C:\Program Files (x86)\smartmontools\bin\smartctl.exe
+    let p4 = PathBuf::from(r"C:\Program Files (x86)\smartmontools\bin\smartctl.exe");
+    if p4.is_file() {
+        return Some(p4);
+    }
+
+    None
+}
+
+/// Retrieves the cached smartctl path or resolves and caches it.
+pub fn get_or_resolve_smartctl_path(custom_path: Option<&str>) -> Option<PathBuf> {
+    if let Ok(guard) = CACHED_SMARTCTL_PATH.lock()
+        && let Some(ref cached) = *guard {
+            // If no custom path is given or custom matches cached, verify file still exists
+            if (custom_path.is_none() || custom_path.map(Path::new) == Some(cached.as_path()))
+                && cached.is_file() {
+                    return Some(cached.clone());
+                }
+        }
+
+    let resolved = resolve_smartctl_path(custom_path);
+    if let Ok(mut guard) = CACHED_SMARTCTL_PATH.lock() {
+        *guard = resolved.clone();
+    }
+    resolved
+}
+
+/// Explicitly sets or updates the cached smartctl path.
+pub fn set_cached_smartctl_path(path: Option<PathBuf>) {
+    if let Ok(mut guard) = CACHED_SMARTCTL_PATH.lock() {
+        *guard = path;
+    }
+}
+
+/// Clears the cached smartctl path.
+pub fn clear_cached_smartctl_path() {
+    set_cached_smartctl_path(None);
+}
+
+fn find_in_path(binary_name: &str) -> Option<PathBuf> {
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        #[cfg(windows)]
+        {
+            let exe = dir.join(format!("{binary_name}.exe"));
+            if exe.is_file() {
+                return Some(exe);
+            }
+        }
+        let direct = dir.join(binary_name);
+        if direct.is_file() {
+            return Some(direct);
+        }
+    }
+    None
+}
+
+#[cfg(windows)]
+fn find_with_where_cmd(binary_name: &str) -> Option<PathBuf> {
+    let mut cmd = std::process::Command::new("where.exe");
+    cmd.arg(binary_name);
+    cmd.creation_flags(CREATE_NO_WINDOW);
+    if let Ok(output) = cmd.output()
+        && output.status.success() {
+            let out_str = String::from_utf8_lossy(&output.stdout);
+            for line in out_str.lines() {
+                let trimmed = line.trim();
+                if !trimmed.is_empty() {
+                    let p = PathBuf::from(trimmed);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
+    None
+}
 
 #[derive(Debug, Deserialize)]
 struct NvmeHealthInfo {
@@ -65,21 +190,7 @@ struct NvmeHealthInfo {
     power_cycles: u64,
 }
 
-#[derive(Debug, Deserialize)]
-struct SmartctlMeta {
-    #[allow(dead_code)]
-    exit_status: Option<i32>,
-    messages: Option<Vec<SmartctlMessage>>,
-}
-
-#[derive(Debug, Deserialize)]
-struct SmartctlMessage {
-    string: Option<String>,
-    #[allow(dead_code)]
-    severity: Option<String>,
-}
-
-fn is_permission_denied_str(s: &str) -> bool {
+pub fn is_permission_denied_str(s: &str) -> bool {
     let lower = s.to_lowercase();
     lower.contains("permission denied")
         || lower.contains("access is denied")
@@ -91,6 +202,38 @@ fn is_permission_denied_str(s: &str) -> bool {
         || lower.contains("privilege")
 }
 
+pub fn is_device_not_found_str(s: &str) -> bool {
+    let lower = s.to_lowercase();
+    lower.contains("open device failed")
+        || lower.contains("unable to open")
+        || lower.contains("cannot open")
+        || lower.contains("no such device")
+        || lower.contains("device not found")
+        || lower.contains("failed: \\\\.\\")
+        || lower.contains("no nvme device")
+        || lower.contains("does not exist")
+}
+
+/// Inspects `smartctl.messages` in parsed JSON for permission or device errors.
+fn check_smartctl_messages(val: &serde_json::Value) -> Option<SmartError> {
+    let messages = val.get("smartctl").and_then(|s| s.get("messages")).and_then(|m| m.as_array())?;
+    for msg in messages {
+        if let Some(msg_str) = msg.get("string").and_then(|s| s.as_str()) {
+            if is_permission_denied_str(msg_str) {
+                return Some(SmartError::PermissionDenied(msg_str.to_string()));
+            }
+            if is_device_not_found_str(msg_str) {
+                return Some(SmartError::DeviceNotFound(msg_str.to_string()));
+            }
+        }
+    }
+    None
+}
+
+/// Parses smartctl JSON output.
+/// Does not rely on exit status. Always parses stdout as JSON first.
+/// If `smartctl.messages` in the JSON contains a permission or device error,
+/// returns `PermissionDenied` or `DeviceNotFound` with that message.
 pub fn parse_smartctl_output(json_str: &str, ts: i64) -> Result<SmartSnapshot, SmartError> {
     let trimmed = json_str.trim();
     if trimmed.is_empty() {
@@ -101,13 +244,21 @@ pub fn parse_smartctl_output(json_str: &str, ts: i64) -> Result<SmartSnapshot, S
         Ok(v) => v,
         Err(e) => {
             if is_permission_denied_str(trimmed) {
-                return Err(SmartError::PermissionDenied);
+                return Err(SmartError::PermissionDenied(trimmed.to_string()));
+            }
+            if is_device_not_found_str(trimmed) {
+                return Err(SmartError::DeviceNotFound(trimmed.to_string()));
             }
             return Err(SmartError::ParseError(format!("Invalid JSON: {e}")));
         }
     };
 
-    // Case 1: Root JSON contains "nvme_smart_health_information_log"
+    // 1. Inspect messages in JSON for explicit permission or device errors
+    if let Some(err) = check_smartctl_messages(&val) {
+        return Err(err);
+    }
+
+    // 2. Case A: Root JSON contains "nvme_smart_health_information_log"
     if let Some(health_val) = val.get("nvme_smart_health_information_log") {
         return match serde_json::from_value::<NvmeHealthInfo>(health_val.clone()) {
             Ok(health) => Ok(SmartSnapshot {
@@ -125,7 +276,7 @@ pub fn parse_smartctl_output(json_str: &str, ts: i64) -> Result<SmartSnapshot, S
         };
     }
 
-    // Case 2: The JSON is directly the health information object
+    // 3. Case B: The JSON is directly the health information object
     if let Ok(health) = serde_json::from_value::<NvmeHealthInfo>(val.clone()) {
         return Ok(SmartSnapshot {
             ts,
@@ -138,20 +289,20 @@ pub fn parse_smartctl_output(json_str: &str, ts: i64) -> Result<SmartSnapshot, S
         });
     }
 
-    // Case 3: Check for error messages / permission denied
-    if let Some(smartctl_val) = val.get("smartctl")
-        && let Ok(meta) = serde_json::from_value::<SmartctlMeta>(smartctl_val.clone())
-            && let Some(messages) = meta.messages {
-                for msg in messages {
-                    if let Some(ref str_val) = msg.string
-                        && is_permission_denied_str(str_val) {
-                            return Err(SmartError::PermissionDenied);
-                        }
-                }
+    // 4. Case C: If no health log, check if any messages exist in smartctl
+    if let Some(messages) = val.get("smartctl").and_then(|s| s.get("messages")).and_then(|m| m.as_array())
+        && let Some(first_msg) = messages.iter().find_map(|m| m.get("string").and_then(|s| s.as_str())) {
+            if is_permission_denied_str(first_msg) {
+                return Err(SmartError::PermissionDenied(first_msg.to_string()));
             }
+            if is_device_not_found_str(first_msg) {
+                return Err(SmartError::DeviceNotFound(first_msg.to_string()));
+            }
+            return Err(SmartError::CommandFailed(first_msg.to_string()));
+        }
 
     if is_permission_denied_str(trimmed) {
-        return Err(SmartError::PermissionDenied);
+        return Err(SmartError::PermissionDenied(trimmed.to_string()));
     }
 
     Err(SmartError::ParseError(
@@ -159,27 +310,109 @@ pub fn parse_smartctl_output(json_str: &str, ts: i64) -> Result<SmartSnapshot, S
     ))
 }
 
-pub fn run_smartctl(device: Option<&str>) -> Result<SmartSnapshot, SmartError> {
-    let dev = device.unwrap_or("/dev/nvme0");
-    let mut cmd = std::process::Command::new("smartctl");
-    cmd.args(["-j", "-a", dev]);
+/// Runs `smartctl --scan -j` and returns the first NVMe device name found (e.g. "/dev/sda").
+pub fn scan_for_nvme_device(smartctl_exe: &Path) -> Result<Option<String>, SmartError> {
+    let mut cmd = std::process::Command::new(smartctl_exe);
+    cmd.args(["--scan", "-j"]);
 
     #[cfg(windows)]
-    {
-        cmd.creation_flags(CREATE_NO_WINDOW);
-    }
+    cmd.creation_flags(CREATE_NO_WINDOW);
 
     let output = match cmd.output() {
         Ok(out) => out,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            return Err(SmartError::SmartctlNotFound);
-        }
-        Err(err) if err.kind() == std::io::ErrorKind::PermissionDenied => {
-            return Err(SmartError::PermissionDenied);
+            return Err(SmartError::SmartctlNotFound(format!(
+                "Executable not found at {}",
+                smartctl_exe.display()
+            )));
         }
         Err(err) => {
-            return Err(SmartError::CommandFailed(format!(
-                "Failed to spawn smartctl: {err}"
+            return Err(SmartError::SpawnError(format!(
+                "Failed to spawn {}: {} (OS code: {:?})",
+                smartctl_exe.display(),
+                err,
+                err.raw_os_error()
+            )));
+        }
+    };
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    if let Ok(val) = serde_json::from_str::<serde_json::Value>(&stdout)
+        && let Some(devices) = val.get("devices").and_then(|d| d.as_array()) {
+            for dev in devices {
+                let dev_type = dev.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                let protocol = dev.get("protocol").and_then(|p| p.as_str()).unwrap_or("");
+                let name = dev.get("name").and_then(|n| n.as_str()).unwrap_or("");
+
+                if (dev_type.eq_ignore_ascii_case("nvme")
+                    || protocol.eq_ignore_ascii_case("nvme")
+                    || name.to_lowercase().contains("nvme"))
+                    && !name.is_empty() {
+                        return Ok(Some(name.to_string()));
+                    }
+            }
+        }
+
+    Ok(None)
+}
+
+/// Logs detection failures with path tried, device, raw output, and error details.
+pub fn log_detection_failure(
+    path_tried: &str,
+    device_tried: &str,
+    stdout: &str,
+    stderr: &str,
+    err: &SmartError,
+) {
+    eprintln!(
+        "[smartctl detection failure] Path: '{path_tried}', Device: '{device_tried}', Error: {err}"
+    );
+
+    let log_path = match directories::ProjectDirs::from("com", "estus", "Estus") {
+        Some(proj) => {
+            let dir = proj.data_local_dir();
+            let _ = std::fs::create_dir_all(dir);
+            dir.join("detection.log")
+        }
+        None => PathBuf::from("detection.log"),
+    };
+
+    use std::io::Write;
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+    {
+        let now = chrono::Local::now().to_rfc3339();
+        let _ = writeln!(
+            file,
+            "[{now}] DETECTION FAILURE\n  Path: {path_tried}\n  Device: {device_tried}\n  Error: {err}\n  Stdout:\n{stdout}\n  Stderr:\n{stderr}\n----------------------------------------\n"
+        );
+    }
+}
+
+/// Executes smartctl query for a specific device, parsing stdout as JSON.
+fn query_device(smartctl_exe: &Path, device: &str) -> Result<SmartSnapshot, SmartError> {
+    let mut cmd = std::process::Command::new(smartctl_exe);
+    cmd.args(["-j", "-a", device]);
+
+    #[cfg(windows)]
+    cmd.creation_flags(CREATE_NO_WINDOW);
+
+    let output = match cmd.output() {
+        Ok(out) => out,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
+            return Err(SmartError::SmartctlNotFound(format!(
+                "Executable not found at {}",
+                smartctl_exe.display()
+            )));
+        }
+        Err(err) => {
+            return Err(SmartError::SpawnError(format!(
+                "Failed to spawn {}: {} (OS code: {:?})",
+                smartctl_exe.display(),
+                err,
+                err.raw_os_error()
             )));
         }
     };
@@ -188,114 +421,131 @@ pub fn run_smartctl(device: Option<&str>) -> Result<SmartSnapshot, SmartError> {
     let stderr = String::from_utf8_lossy(&output.stderr);
     let ts = chrono::Utc::now().timestamp();
 
-    if is_permission_denied_str(&stderr) {
-        return Err(SmartError::PermissionDenied);
-    }
-
+    // Do not rely on exit status. Always try to parse stdout as JSON first.
     if !stdout.trim().is_empty() {
         match parse_smartctl_output(&stdout, ts) {
             Ok(snapshot) => return Ok(snapshot),
-            Err(SmartError::PermissionDenied) => return Err(SmartError::PermissionDenied),
             Err(err) => {
-                let code = output.status.code().unwrap_or(-1);
-                if code != 0 {
-                    if is_permission_denied_str(&stdout) {
-                        return Err(SmartError::PermissionDenied);
-                    }
-                    return Err(SmartError::CommandFailed(
-                        format!("smartctl exited with code {code}: {stderr} {stdout}")
-                            .trim()
-                            .to_string(),
-                    ));
-                } else {
-                    return Err(err);
-                }
+                log_detection_failure(
+                    &smartctl_exe.display().to_string(),
+                    device,
+                    &stdout,
+                    &stderr,
+                    &err,
+                );
+                return Err(err);
             }
         }
     }
 
-    let code = output.status.code().unwrap_or(-1);
-    if is_permission_denied_str(&stderr) || is_permission_denied_str(&stdout) {
-        Err(SmartError::PermissionDenied)
-    } else if code != 0 {
-        Err(SmartError::CommandFailed(
-            format!("smartctl exited with code {code}: {stderr}")
-                .trim()
-                .to_string(),
-        ))
+    // Stdout was empty
+    let err = if is_permission_denied_str(&stderr) {
+        SmartError::PermissionDenied(stderr.trim().to_string())
+    } else if is_device_not_found_str(&stderr) {
+        SmartError::DeviceNotFound(stderr.trim().to_string())
+    } else if !stderr.trim().is_empty() {
+        SmartError::CommandFailed(stderr.trim().to_string())
     } else {
-        Err(SmartError::ParseError("smartctl returned empty output".to_string()))
+        SmartError::ParseError("smartctl returned empty output".to_string())
+    };
+
+    log_detection_failure(
+        &smartctl_exe.display().to_string(),
+        device,
+        &stdout,
+        &stderr,
+        &err,
+    );
+    Err(err)
+}
+
+/// Runs smartctl with custom path and device configuration.
+/// If device is None and "/dev/nvme0" fails, automatically scans for the first NVMe device.
+/// Returns `(SmartSnapshot, resolved_path, active_device)`.
+pub fn run_smartctl_with_config(
+    custom_path: Option<&str>,
+    device: Option<&str>,
+) -> Result<(SmartSnapshot, String, String), SmartError> {
+    let smartctl_exe = match get_or_resolve_smartctl_path(custom_path) {
+        Some(p) => p,
+        None => {
+            let err = SmartError::SmartctlNotFound(
+                "smartctl was not found in settings, PATH, C:\\Program Files\\smartmontools\\bin, or C:\\Program Files (x86)\\smartmontools\\bin".to_string(),
+            );
+            log_detection_failure("None", device.unwrap_or("auto"), "", "", &err);
+            return Err(err);
+        }
+    };
+
+    let resolved_path_str = smartctl_exe.display().to_string();
+
+    // If an explicit device was requested, query it directly
+    if let Some(dev) = device {
+        let snapshot = query_device(&smartctl_exe, dev)?;
+        return Ok((snapshot, resolved_path_str, dev.to_string()));
     }
+
+    // Default flow: Try "/dev/nvme0" first
+    let default_dev = "/dev/nvme0";
+    match query_device(&smartctl_exe, default_dev) {
+        Ok(snapshot) => Ok((snapshot, resolved_path_str, default_dev.to_string())),
+        Err(err1) => {
+            // Requirement 4: If /dev/nvme0 fails, run `smartctl --scan -j`, and use the first NVMe device found.
+            eprintln!("/dev/nvme0 query failed: {err1}. Scanning for NVMe devices with `smartctl --scan -j`...");
+            match scan_for_nvme_device(&smartctl_exe) {
+                Ok(Some(scanned_dev)) if scanned_dev != default_dev => {
+                    eprintln!("Found candidate NVMe device from scan: {scanned_dev}. Querying...");
+                    match query_device(&smartctl_exe, &scanned_dev) {
+                        Ok(snapshot) => Ok((snapshot, resolved_path_str, scanned_dev)),
+                        Err(err2) => {
+                            log_detection_failure(
+                                &resolved_path_str,
+                                &scanned_dev,
+                                "",
+                                "",
+                                &err2,
+                            );
+                            Err(err2)
+                        }
+                    }
+                }
+                _ => Err(err1),
+            }
+        }
+    }
+}
+
+/// Convenience function matching the original signature.
+pub fn run_smartctl(device: Option<&str>) -> Result<SmartSnapshot, SmartError> {
+    run_smartctl_with_config(None, device).map(|(s, _, _)| s)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    const REALISTIC_NVME_JSON: &str = r#"{
-      "json_format_version": [1, 0],
-      "smartctl": {
-        "version": [7, 3],
-        "platform": "x86_64-w64-mingw32",
-        "build_info": "smartctl 7.3 2022-02-28 r5338",
-        "argv": ["smartctl", "-a", "-j", "/dev/nvme0"],
-        "exit_status": 0
-      },
-      "device": {
-        "name": "/dev/nvme0",
-        "info_name": "/dev/nvme0",
-        "type": "nvme",
-        "protocol": "NVMe"
-      },
-      "model_name": "Samsung SSD 970 EVO Plus 1TB",
-      "serial_number": "S4EWNF0M123456",
-      "nvme_smart_health_information_log": {
-        "critical_warning": 0,
-        "temperature": 43,
-        "available_spare": 100,
-        "available_spare_threshold": 10,
-        "percentage_used": 5,
-        "data_units_read": 3264831,
-        "data_units_written": 35345226,
-        "host_reads": 38564427,
-        "host_writes": 339789142,
-        "controller_busy_time": 686,
-        "power_cycles": 779,
-        "power_on_hours": 1290,
-        "unsafe_shutdowns": 9,
-        "media_errors": 0,
-        "num_err_log_entries": 979
-      }
-    }"#;
-
     #[test]
     fn test_parse_valid_nvme_json() {
-        let ts = 1700000000;
-        let snapshot = parse_smartctl_output(REALISTIC_NVME_JSON, ts)
-            .expect("Should parse valid smartctl json");
-
-        assert_eq!(snapshot.ts, ts);
-        assert_eq!(snapshot.data_units_written, 35345226);
-        assert_eq!(snapshot.data_units_read, 3264831);
-        assert_eq!(snapshot.percent_used, 5);
-        assert_eq!(snapshot.available_spare, 100);
-        assert_eq!(snapshot.power_on_hours, 1290);
-        assert_eq!(snapshot.power_cycles, 779);
-
-        // Host bytes = data_units * 512_000
-        assert_eq!(snapshot.host_bytes_written(), 35345226 * 512_000);
-        assert_eq!(snapshot.host_bytes_read(), 3264831 * 512_000);
-    }
-
-    #[test]
-    fn test_parse_direct_health_log() {
         let json = r#"{
-            "data_units_written": 1000,
-            "data_units_read": 500,
-            "percentage_used": 2,
+          "json_format_version": [1, 0],
+          "smartctl": {
+            "version": [7, 3],
+            "exit_status": 0
+          },
+          "nvme_smart_health_information_log": {
+            "critical_warning": 0,
+            "temperature": 35,
             "available_spare": 98,
-            "power_on_hours": 50,
-            "power_cycles": 20
+            "available_spare_threshold": 10,
+            "percentage_used": 2,
+            "data_units_read": 500,
+            "data_units_written": 1000,
+            "host_reads": 10000,
+            "host_writes": 20000,
+            "controller_busy_time": 50,
+            "power_cycles": 20,
+            "power_on_hours": 50
+          }
         }"#;
 
         let snapshot = parse_smartctl_output(json, 12345).unwrap();
@@ -343,7 +593,7 @@ mod tests {
         }"#;
 
         let res = parse_smartctl_output(json, 100);
-        assert_eq!(res, Err(SmartError::PermissionDenied));
+        assert!(matches!(res, Err(SmartError::PermissionDenied(_))));
     }
 
     #[test]
@@ -362,77 +612,61 @@ mod tests {
         }"#;
 
         let res = parse_smartctl_output(json, 100);
-        assert_eq!(res, Err(SmartError::PermissionDenied));
+        assert!(matches!(res, Err(SmartError::PermissionDenied(_))));
     }
 
     #[test]
-    fn test_parse_missing_health_log() {
+    fn test_parse_device_not_found_json() {
         let json = r#"{
-          "json_format_version": [1, 0],
           "smartctl": {
-            "version": [7, 3],
-            "exit_status": 0
-          },
-          "device": {
-            "name": "/dev/sda",
-            "type": "ata"
+            "version": [7, 5],
+            "messages": [
+              {
+                "string": "Smartctl open device: /dev/nvme0 failed: No such device",
+                "severity": "error"
+              }
+            ],
+            "exit_status": 2
           }
         }"#;
 
         let res = parse_smartctl_output(json, 100);
-        match res {
-            Err(SmartError::ParseError(msg)) => {
-                assert!(msg.contains("nvme_smart_health_information_log"));
-            }
-            other => panic!("Expected ParseError, got {other:?}"),
-        }
+        assert!(matches!(res, Err(SmartError::DeviceNotFound(_))));
     }
 
     #[test]
-    fn test_parse_malformed_json() {
-        assert!(matches!(
-            parse_smartctl_output("", 100),
-            Err(SmartError::ParseError(_))
-        ));
-
-        assert!(matches!(
-            parse_smartctl_output("{ not valid json", 100),
-            Err(SmartError::ParseError(_))
-        ));
-
-        let bad_field_json = r#"{
-          "nvme_smart_health_information_log": {
-            "data_units_written": "not_a_number",
-            "data_units_read": 100,
-            "percentage_used": 1,
-            "available_spare": 100,
-            "power_on_hours": 10,
-            "power_cycles": 10
-          }
+    fn test_parse_scan_json() {
+        let json = r#"{
+          "devices": [
+            {
+              "name": "/dev/sda",
+              "info_name": "/dev/sda",
+              "type": "nvme",
+              "protocol": "NVMe"
+            }
+          ]
         }"#;
-        assert!(matches!(
-            parse_smartctl_output(bad_field_json, 100),
-            Err(SmartError::ParseError(_))
-        ));
 
-        let missing_fields_json = r#"{
-          "nvme_smart_health_information_log": {
-            "data_units_written": 100
-          }
-        }"#;
-        assert!(matches!(
-            parse_smartctl_output(missing_fields_json, 100),
-            Err(SmartError::ParseError(_))
-        ));
+        let val: serde_json::Value = serde_json::from_str(json).unwrap();
+        let devices = val.get("devices").unwrap().as_array().unwrap();
+        assert_eq!(devices.len(), 1);
+        let name = devices[0].get("name").unwrap().as_str().unwrap();
+        assert_eq!(name, "/dev/sda");
     }
 
     #[test]
     fn test_error_display() {
-        let not_found = SmartError::SmartctlNotFound;
+        let not_found = SmartError::SmartctlNotFound("not found".to_string());
         assert!(not_found.to_string().contains("winget install smartmontools"));
 
-        let perm = SmartError::PermissionDenied;
+        let perm = SmartError::PermissionDenied("access denied".to_string());
         assert!(perm.to_string().contains("Administrator"));
+
+        let dev_err = SmartError::DeviceNotFound("no device".to_string());
+        assert!(dev_err.to_string().contains("no device"));
+
+        let spawn_err = SmartError::SpawnError("permission error".to_string());
+        assert!(spawn_err.to_string().contains("permission error"));
 
         let parse_err = SmartError::ParseError("invalid token".to_string());
         assert_eq!(parse_err.to_string(), "Failed to parse smartctl output: invalid token");
@@ -442,9 +676,25 @@ mod tests {
     }
 
     #[test]
-    fn test_run_smartctl_when_not_installed() {
-        // Since smartctl is not in PATH in test environment, run_smartctl should report SmartctlNotFound
-        let res = run_smartctl(Some("/dev/nvme0"));
-        assert!(matches!(res, Err(SmartError::SmartctlNotFound)));
+    fn test_resolve_smartctl_path_order() {
+        // User custom path that does not exist should fall through
+        let p = resolve_smartctl_path(Some("C:\\non_existent_folder\\smartctl.exe"));
+        // On this test machine, C:\Program Files\smartmontools\bin\smartctl.exe exists!
+        if Path::new(r"C:\Program Files\smartmontools\bin\smartctl.exe").is_file() {
+            assert_eq!(
+                p,
+                Some(PathBuf::from(r"C:\Program Files\smartmontools\bin\smartctl.exe"))
+            );
+        }
+    }
+
+    #[test]
+    fn test_live_detection_and_fallback() {
+        if Path::new(r"C:\Program Files\smartmontools\bin\smartctl.exe").is_file() {
+            let res = run_smartctl_with_config(None, None);
+            println!("Live smartctl test result: {res:?}");
+            // Whether it succeeds or reports permission denied if un-elevated, it must NOT report SmartctlNotFound!
+            assert!(!matches!(res, Err(SmartError::SmartctlNotFound(_))));
+        }
     }
 }

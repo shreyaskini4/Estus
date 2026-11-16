@@ -14,6 +14,8 @@ pub struct Settings {
     pub alert_threshold_gb: f64,
     pub start_with_windows: bool,
     pub last_notified_date: Option<NaiveDate>,
+    #[serde(default)]
+    pub custom_smartctl_path: Option<String>,
 }
 
 impl Default for Settings {
@@ -22,6 +24,7 @@ impl Default for Settings {
             alert_threshold_gb: 100.0,
             start_with_windows: false,
             last_notified_date: None,
+            custom_smartctl_path: None,
         }
     }
 }
@@ -105,6 +108,9 @@ pub struct SharedState {
     pub data_changed: bool,
     pub show_window: bool,
     pub should_quit: bool,
+    pub resolved_smartctl_path: Option<String>,
+    pub last_raw_error: Option<String>,
+    pub active_device: Option<String>,
 }
 
 impl SharedState {
@@ -120,6 +126,9 @@ impl SharedState {
             data_changed: false,
             show_window: true,
             should_quit: false,
+            resolved_smartctl_path: None,
+            last_raw_error: None,
+            active_device: None,
         }
     }
 }
@@ -293,20 +302,34 @@ pub fn spawn_smart_poller(state: AppState) -> std::thread::JoinHandle<()> {
         .spawn(move || {
             loop {
                 // Poll SMART
-                match crate::smart::run_smartctl(None) {
-                    Ok(snapshot) => {
+                let custom_path = if let Ok(s) = state.lock() {
+                    s.settings.custom_smartctl_path.clone()
+                } else {
+                    None
+                };
+
+                match crate::smart::run_smartctl_with_config(custom_path.as_deref(), None) {
+                    Ok((snapshot, resolved_path, active_dev)) => {
                         if let Ok(conn) = crate::db::init_db() {
                             let _ = crate::db::insert_snapshot(&conn, &snapshot);
                         }
                         if let Ok(mut s) = state.lock() {
                             s.latest_smart = Some(snapshot);
                             s.smart_error = None;
+                            s.resolved_smartctl_path = Some(resolved_path);
+                            s.active_device = Some(active_dev);
+                            s.last_raw_error = None;
                             s.data_changed = true;
                         }
                     }
                     Err(err) => {
+                        let raw_err = err.to_string();
+                        let resolved = crate::smart::get_or_resolve_smartctl_path(custom_path.as_deref())
+                            .map(|p| p.display().to_string());
                         if let Ok(mut s) = state.lock() {
                             s.smart_error = Some(err);
+                            s.resolved_smartctl_path = resolved;
+                            s.last_raw_error = Some(raw_err);
                             s.data_changed = true;
                         }
                     }
@@ -425,6 +448,7 @@ mod tests {
             alert_threshold_gb: 150.5,
             start_with_windows: true,
             last_notified_date: Some(date),
+            custom_smartctl_path: None,
         };
 
         let json = serde_json::to_string(&s).expect("Serialization failed");
@@ -443,6 +467,7 @@ mod tests {
             alert_threshold_gb: 75.0,
             start_with_windows: true,
             last_notified_date: Some(date),
+            custom_smartctl_path: None,
         };
 
         s.save_to_path(&file_path).expect("Failed to save settings");
@@ -482,6 +507,7 @@ mod tests {
             alert_threshold_gb: 80.0,
             start_with_windows: false,
             last_notified_date: None,
+            custom_smartctl_path: None,
         };
         let state = SharedState::new(s);
 
@@ -502,6 +528,7 @@ mod tests {
             alert_threshold_gb: 50.0,
             start_with_windows: false,
             last_notified_date: None,
+            custom_smartctl_path: None,
         };
         let state = new_app_state(settings);
         let date = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();

@@ -100,6 +100,7 @@ pub struct SsdWatchApp {
     pub time_filter: TimeFilter,
     pub temp_alert_threshold: f64,
     pub temp_start_with_windows: bool,
+    pub temp_custom_smartctl_path: String,
     pub settings_status_msg: Option<(String, bool)>,
     pub is_refreshing: bool,
     pub _tray: Option<tray_icon::TrayIcon>,
@@ -109,10 +110,14 @@ pub struct SsdWatchApp {
 
 impl SsdWatchApp {
     pub fn new(state: AppState) -> Self {
-        let (threshold, start_with_win) = if let Ok(s) = state.lock() {
-            (s.settings.alert_threshold_gb, s.settings.start_with_windows)
+        let (threshold, start_with_win, custom_path) = if let Ok(s) = state.lock() {
+            (
+                s.settings.alert_threshold_gb,
+                s.settings.start_with_windows,
+                s.settings.custom_smartctl_path.clone().unwrap_or_default(),
+            )
         } else {
-            (100.0, false)
+            (100.0, false, String::new())
         };
 
         Self {
@@ -120,11 +125,32 @@ impl SsdWatchApp {
             time_filter: TimeFilter::Today,
             temp_alert_threshold: threshold,
             temp_start_with_windows: start_with_win,
+            temp_custom_smartctl_path: custom_path,
             settings_status_msg: None,
             is_refreshing: false,
             _tray: None,
             _show_id: None,
             _quit_id: None,
+        }
+    }
+
+    /// Opens a file dialog allowing the user to select smartctl.exe, saving the choice to settings.
+    pub fn browse_for_smartctl(&mut self) {
+        if let Some(file_path) = rfd::FileDialog::new()
+            .add_filter("smartctl executable", &["exe"])
+            .set_title("Locate smartctl.exe")
+            .pick_file()
+        {
+            let path_str = file_path.to_string_lossy().to_string();
+            self.temp_custom_smartctl_path = path_str.clone();
+            if let Ok(mut s) = self.state.lock() {
+                s.settings.custom_smartctl_path = Some(path_str.clone());
+                let _ = s.settings.save();
+                s.resolved_smartctl_path = Some(path_str.clone());
+                s.data_changed = true;
+            }
+            crate::smart::set_cached_smartctl_path(Some(file_path));
+            self.trigger_refresh();
         }
     }
 
@@ -143,8 +169,14 @@ impl SsdWatchApp {
     pub fn trigger_refresh(&mut self) {
         let state_clone = Arc::clone(&self.state);
         std::thread::spawn(move || {
-            match crate::smart::run_smartctl(None) {
-                Ok(snapshot) => {
+            let custom_path = if let Ok(s) = state_clone.lock() {
+                s.settings.custom_smartctl_path.clone()
+            } else {
+                None
+            };
+
+            match crate::smart::run_smartctl_with_config(custom_path.as_deref(), None) {
+                Ok((snapshot, resolved_path, active_dev)) => {
                     if let Ok(conn) = crate::db::init_db() {
                         let _ = crate::db::insert_snapshot(&conn, &snapshot);
                         let daily = crate::db::daily_writes(&conn, 30).unwrap_or_default();
@@ -166,6 +198,9 @@ impl SsdWatchApp {
                         if let Ok(mut s) = state_clone.lock() {
                             s.latest_smart = Some(snapshot);
                             s.smart_error = None;
+                            s.resolved_smartctl_path = Some(resolved_path);
+                            s.active_device = Some(active_dev);
+                            s.last_raw_error = None;
                             s.daily_writes = daily;
                             s.top_processes_today = top_today;
                             s.top_processes_7d = top_7d;
@@ -175,8 +210,13 @@ impl SsdWatchApp {
                     }
                 }
                 Err(err) => {
+                    let raw_err = err.to_string();
+                    let resolved = crate::smart::get_or_resolve_smartctl_path(custom_path.as_deref())
+                        .map(|p| p.display().to_string());
                     if let Ok(mut s) = state_clone.lock() {
                         s.smart_error = Some(err);
+                        s.resolved_smartctl_path = resolved;
+                        s.last_raw_error = Some(raw_err);
                         s.data_changed = true;
                     }
                 }
@@ -219,7 +259,18 @@ impl eframe::App for SsdWatchApp {
         }
 
         // Snapshot current state data under brief lock
-        let (latest_smart, smart_error, daily_writes, top_today, top_7d, top_30d, settings) = {
+        let (
+            latest_smart,
+            smart_error,
+            daily_writes,
+            top_today,
+            top_7d,
+            top_30d,
+            settings,
+            resolved_path,
+            active_dev,
+            last_raw_err,
+        ) = {
             if let Ok(s) = self.state.lock() {
                 (
                     s.latest_smart.clone(),
@@ -229,6 +280,9 @@ impl eframe::App for SsdWatchApp {
                     s.top_processes_7d.clone(),
                     s.top_processes_30d.clone(),
                     s.settings.clone(),
+                    s.resolved_smartctl_path.clone(),
+                    s.active_device.clone(),
+                    s.last_raw_error.clone(),
                 )
             } else {
                 return;
@@ -242,11 +296,28 @@ impl eframe::App for SsdWatchApp {
                 // Top Header Bar
                 render_header(ui, self);
 
-                ui.add_space(10.0);
+                ui.add_space(6.0);
+
+                // Detection status bar (resolved path, active device, browse button)
+                render_status_area(
+                    ui,
+                    self,
+                    resolved_path.as_deref(),
+                    active_dev.as_deref(),
+                    last_raw_err.as_deref(),
+                );
+
+                ui.add_space(8.0);
 
                 // Top Banner / Error Card
                 if let Some(ref err) = smart_error {
-                    render_error_banner(ui, err);
+                    render_error_banner(
+                        ui,
+                        self,
+                        err,
+                        resolved_path.as_deref(),
+                        last_raw_err.as_deref(),
+                    );
                 }
 
                 // Top 4 Metric Cards
@@ -302,8 +373,59 @@ fn render_header(ui: &mut egui::Ui, app: &mut SsdWatchApp) {
     });
 }
 
+/// Renders the status area displaying resolved smartctl path, active NVMe device, last error, and Browse button.
+fn render_status_area(
+    ui: &mut egui::Ui,
+    app: &mut SsdWatchApp,
+    resolved_path: Option<&str>,
+    active_device: Option<&str>,
+    last_raw_error: Option<&str>,
+) {
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_rgb(22, 24, 30))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(45, 50, 62)))
+        .corner_radius(6.0)
+        .inner_margin(egui::Margin::symmetric(10, 6))
+        .show(ui, |ui| {
+            ui.horizontal_wrapped(|ui| {
+                ui.label(RichText::new("smartctl:").strong().color(Color32::from_rgb(180, 185, 200)));
+                if let Some(p) = resolved_path {
+                    ui.monospace(RichText::new(p).color(Color32::from_rgb(130, 200, 255)));
+                } else {
+                    ui.label(RichText::new("Not found").color(Color32::from_rgb(255, 120, 120)));
+                }
+
+                if let Some(dev) = active_device {
+                    ui.separator();
+                    ui.label(RichText::new("NVMe:").strong().color(Color32::from_rgb(180, 185, 200)));
+                    ui.monospace(RichText::new(dev).color(Color32::from_rgb(120, 225, 150)));
+                }
+
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    if ui.button("📁 Browse for smartctl.exe").clicked() {
+                        app.browse_for_smartctl();
+                    }
+                });
+            });
+
+            if let Some(raw_err) = last_raw_error {
+                ui.add_space(2.0);
+                ui.horizontal_wrapped(|ui| {
+                    ui.label(RichText::new("Last raw error:").small().strong().color(Color32::from_rgb(255, 130, 130)));
+                    ui.monospace(RichText::new(raw_err).small().color(Color32::from_rgb(240, 170, 170)));
+                });
+            }
+        });
+}
+
 /// Renders prominent guidance banner if SMART collection encountered an error.
-fn render_error_banner(ui: &mut egui::Ui, err: &SmartError) {
+fn render_error_banner(
+    ui: &mut egui::Ui,
+    app: &mut SsdWatchApp,
+    err: &SmartError,
+    resolved_path: Option<&str>,
+    last_raw_error: Option<&str>,
+) {
     egui::Frame::group(ui.style())
         .fill(Color32::from_rgb(45, 20, 20))
         .stroke(Stroke::new(1.0, Color32::from_rgb(220, 53, 69)))
@@ -314,15 +436,20 @@ fn render_error_banner(ui: &mut egui::Ui, err: &SmartError) {
                 ui.label(RichText::new("⚠️").size(24.0));
                 ui.vertical(|ui| {
                     match err {
-                        SmartError::SmartctlNotFound => {
+                        SmartError::SmartctlNotFound(msg) => {
                             ui.strong(
-                                RichText::new("smartctl Not Found")
+                                RichText::new("smartctl Executable Not Found")
                                     .color(Color32::from_rgb(255, 100, 100)),
                             );
                             ui.label(
-                                "smartmontools is not installed or not in PATH. Run `winget install smartmontools` in PowerShell, or download it from smartmontools.org.",
+                                "smartmontools is not installed, not in PATH, or not found at the configured location. Install it via `winget install smartmontools`, or browse directly for smartctl.exe below.",
                             );
+                            ui.label(RichText::new(format!("Search info: {msg}")).small().color(Color32::LIGHT_GRAY));
+                            ui.add_space(4.0);
                             ui.horizontal(|ui| {
+                                if ui.button("📁 Browse for smartctl.exe").clicked() {
+                                    app.browse_for_smartctl();
+                                }
                                 ui.label(
                                     RichText::new("PowerShell:")
                                         .small()
@@ -331,14 +458,29 @@ fn render_error_banner(ui: &mut egui::Ui, err: &SmartError) {
                                 ui.monospace("winget install smartmontools");
                             });
                         }
-                        SmartError::PermissionDenied => {
+                        SmartError::PermissionDenied(msg) => {
                             ui.strong(
                                 RichText::new("Administrator Permission Required")
                                     .color(Color32::from_rgb(255, 100, 100)),
                             );
                             ui.label(
-                                "Administrator permission required. Right click Estus and select 'Run as Administrator'.",
+                                "Administrator permission required to read NVMe SMART data. Please right-click Estus and select 'Run as Administrator'.",
                             );
+                            ui.label(RichText::new(format!("Details: {msg}")).small().color(Color32::LIGHT_GRAY));
+                        }
+                        SmartError::DeviceNotFound(msg) => {
+                            ui.strong(
+                                RichText::new("NVMe Device Not Found")
+                                    .color(Color32::from_rgb(255, 140, 100)),
+                            );
+                            ui.label(format!("Device query failed: {msg}"));
+                        }
+                        SmartError::SpawnError(msg) => {
+                            ui.strong(
+                                RichText::new("Failed to Spawn smartctl Process")
+                                    .color(Color32::from_rgb(255, 100, 100)),
+                            );
+                            ui.label(format!("Process error: {msg}"));
                         }
                         other => {
                             ui.strong(
@@ -347,6 +489,22 @@ fn render_error_banner(ui: &mut egui::Ui, err: &SmartError) {
                             );
                             ui.label(format!("{other}"));
                         }
+                    }
+
+                    if let Some(path) = resolved_path {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Path tried:").small().color(Color32::GRAY));
+                            ui.monospace(RichText::new(path).small().color(Color32::LIGHT_GRAY));
+                        });
+                    }
+
+                    if let Some(raw_err) = last_raw_error {
+                        ui.add_space(2.0);
+                        ui.horizontal(|ui| {
+                            ui.label(RichText::new("Last raw error:").small().color(Color32::from_rgb(255, 160, 160)));
+                            ui.monospace(RichText::new(raw_err).small().color(Color32::from_rgb(255, 200, 200)));
+                        });
                     }
                 });
             });
@@ -727,6 +885,30 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp) {
                 ui.add_space(6.0);
 
                 ui.horizontal(|ui| {
+                    ui.label("smartctl.exe Path:");
+                    ui.add(
+                        egui::TextEdit::singleline(&mut app.temp_custom_smartctl_path)
+                            .hint_text("Auto-detected / Default")
+                            .desired_width(280.0),
+                    );
+                    if ui.button("📁 Browse...").clicked() {
+                        app.browse_for_smartctl();
+                    }
+                    if ui.button("Auto-detect / Clear").clicked() {
+                        app.temp_custom_smartctl_path.clear();
+                        if let Ok(mut s) = app.state.lock() {
+                            s.settings.custom_smartctl_path = None;
+                            let _ = s.settings.save();
+                            s.data_changed = true;
+                        }
+                        crate::smart::clear_cached_smartctl_path();
+                        app.trigger_refresh();
+                    }
+                });
+
+                ui.add_space(4.0);
+
+                ui.horizontal(|ui| {
                     ui.label("Daily Alert Threshold (GB):");
                     ui.add(
                         egui::Slider::new(&mut app.temp_alert_threshold, 1.0..=1000.0)
@@ -750,6 +932,11 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp) {
                         if let Ok(mut s) = app.state.lock() {
                             s.settings.alert_threshold_gb = app.temp_alert_threshold;
                             s.settings.start_with_windows = app.temp_start_with_windows;
+                            s.settings.custom_smartctl_path = if app.temp_custom_smartctl_path.trim().is_empty() {
+                                None
+                            } else {
+                                Some(app.temp_custom_smartctl_path.trim().to_string())
+                            };
                             if let Err(e) = s.settings.save() {
                                 result = Err(format!("Failed to save settings: {e}"));
                             } else if let Err(e) = s.settings.apply_auto_launch() {
@@ -760,6 +947,9 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp) {
                         } else {
                             result = Err("Could not acquire state lock".to_string());
                         }
+
+                        crate::smart::clear_cached_smartctl_path();
+                        app.trigger_refresh();
 
                         match result {
                             Ok(()) => {
@@ -866,6 +1056,7 @@ mod tests {
             alert_threshold_gb: 75.0,
             start_with_windows: true,
             last_notified_date: None,
+            custom_smartctl_path: None,
         };
         let state = new_app_state(settings);
         let app = SsdWatchApp::new(state);
