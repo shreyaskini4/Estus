@@ -106,6 +106,7 @@ pub struct SsdWatchApp {
     pub time_filter: TimeFilter,
     pub temp_alert_threshold: f64,
     pub temp_start_with_windows: bool,
+    pub autostart_system_configured: bool,
     pub temp_custom_smartctl_path: String,
     pub temp_drive_nicknames: std::collections::HashMap<String, String>,
     pub temp_drive_enabled: std::collections::HashMap<String, bool>,
@@ -117,7 +118,7 @@ pub struct SsdWatchApp {
 
 impl SsdWatchApp {
     pub fn new(state: AppState) -> Self {
-        let (threshold, start_with_win, custom_path) = if let Ok(s) = state.lock() {
+        let (threshold, _start_with_win, custom_path) = if let Ok(s) = state.lock() {
             (
                 s.settings.alert_threshold_gb,
                 s.settings.start_with_windows,
@@ -127,11 +128,24 @@ impl SsdWatchApp {
             (100.0, false, String::new())
         };
 
+        // Query actual system state from Windows Task Scheduler rather than solely trusting JSON
+        #[cfg(not(test))]
+        let system_autostart = crate::autostart::is_enabled();
+        #[cfg(test)]
+        let system_autostart = _start_with_win;
+
+        // Keep settings synchronized if they differ from the actual system state
+        if let Ok(mut s) = state.lock()
+            && s.settings.start_with_windows != system_autostart {
+                s.settings.start_with_windows = system_autostart;
+            }
+
         Self {
             state,
             time_filter: TimeFilter::Today,
             temp_alert_threshold: threshold,
-            temp_start_with_windows: start_with_win,
+            temp_start_with_windows: system_autostart,
+            autostart_system_configured: system_autostart,
             temp_custom_smartctl_path: custom_path,
             temp_drive_nicknames: std::collections::HashMap::new(),
             temp_drive_enabled: std::collections::HashMap::new(),
@@ -139,6 +153,20 @@ impl SsdWatchApp {
             _tray: None,
             _show_id: None,
             _quit_id: None,
+        }
+    }
+
+    /// Synchronizes the in-memory autostart toggle and status indicator with Windows Task Scheduler.
+    pub fn sync_autostart_with_system(&mut self) {
+        #[cfg(not(test))]
+        let is_sys = crate::autostart::is_enabled();
+        #[cfg(test)]
+        let is_sys = self.autostart_system_configured;
+
+        self.temp_start_with_windows = is_sys;
+        self.autostart_system_configured = is_sys;
+        if let Ok(mut s) = self.state.lock() {
+            s.settings.start_with_windows = is_sys;
         }
     }
 
@@ -1268,9 +1296,34 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
 
                 ui.add_space(6.0);
 
-                ui.checkbox(
-                    &mut app.temp_start_with_windows,
-                    "Start with Windows (Launch on system startup)",
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut app.temp_start_with_windows,
+                        "Start with Windows (Launch on system startup)",
+                    );
+                    let (status_text, status_color) = if app.autostart_system_configured {
+                        (
+                            "(Scheduled Task configured: Yes)",
+                            Color32::from_rgb(100, 220, 120),
+                        )
+                    } else {
+                        (
+                            "(Scheduled Task configured: No)",
+                            Color32::from_rgb(160, 165, 180),
+                        )
+                    };
+                    ui.label(RichText::new(status_text).color(status_color).small());
+                    if ui.small_button("🔄 Check").clicked() {
+                        app.sync_autostart_with_system();
+                    }
+                });
+
+                ui.label(
+                    RichText::new(
+                        "Estus runs via Windows Task Scheduler with highest available privileges (no UAC prompt on logon).",
+                    )
+                    .small()
+                    .color(Color32::from_rgb(140, 145, 160)),
                 );
 
                 ui.add_space(10.0);
@@ -1382,14 +1435,27 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
                             }
 
                             if let Err(e) = s.settings.save() {
-                                result = Err(format!("Failed to save settings: {e}"));
-                            } else if let Err(e) = s.settings.apply_auto_launch() {
-                                result = Err(format!("Saved settings, but auto-launch error: {e}"));
+                                result = Err(format!(
+                                    "Failed to save settings: {e}. See %LOCALAPPDATA%\\estus\\Estus\\data\\estus.log for details"
+                                ));
+                            } else if let Err(e) = s.settings.apply_autostart() {
+                                result = Err(format!(
+                                    "Saved settings, but failed to configure Windows autostart: {e}. See %LOCALAPPDATA%\\estus\\Estus\\data\\estus.log for details"
+                                ));
                             } else {
                                 s.data_changed = true;
                             }
                         } else {
                             result = Err("Could not acquire state lock".to_string());
+                        }
+
+                        #[cfg(not(test))]
+                        {
+                            app.autostart_system_configured = crate::autostart::is_enabled();
+                        }
+                        #[cfg(test)]
+                        {
+                            app.autostart_system_configured = app.temp_start_with_windows;
                         }
 
                         app.trigger_refresh();
@@ -1408,18 +1474,19 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
                     }
 
                     if ui.button("🔄 Refresh Now").clicked() {
+                        app.sync_autostart_with_system();
                         app.trigger_refresh();
                     }
                 });
 
                 if let Some((ref msg, is_err)) = app.settings_status_msg {
-                    ui.add_space(4.0);
+                    ui.add_space(6.0);
                     let color = if is_err {
                         Color32::from_rgb(255, 100, 100)
                     } else {
                         Color32::from_rgb(100, 220, 120)
                     };
-                    ui.label(RichText::new(msg).color(color));
+                    ui.add(egui::Label::new(RichText::new(msg).color(color).strong()).wrap());
                 }
             });
         });
@@ -1514,6 +1581,51 @@ mod tests {
         assert_eq!(app.time_filter, TimeFilter::Today);
         assert!((app.temp_alert_threshold - 75.0).abs() < 1e-6);
         assert!(app.temp_start_with_windows);
+        assert!(app.autostart_system_configured);
         assert_eq!(app.settings_status_msg, None);
+    }
+
+    #[test]
+    fn test_ssd_watch_app_creation_autostart_disabled() {
+        let settings = Settings {
+            alert_threshold_gb: 50.0,
+            start_with_windows: false,
+            last_notified_date: None,
+            custom_smartctl_path: None,
+            drives: std::collections::HashMap::new(),
+        };
+        let state = new_app_state(settings);
+        let app = SsdWatchApp::new(state);
+
+        assert_eq!(app.time_filter, TimeFilter::Today);
+        assert!((app.temp_alert_threshold - 50.0).abs() < 1e-6);
+        assert!(!app.temp_start_with_windows);
+        assert!(!app.autostart_system_configured);
+        assert_eq!(app.settings_status_msg, None);
+    }
+
+    #[test]
+    fn test_ssd_watch_app_autostart_sync() {
+        let settings = Settings {
+            alert_threshold_gb: 75.0,
+            start_with_windows: false,
+            last_notified_date: None,
+            custom_smartctl_path: None,
+            drives: std::collections::HashMap::new(),
+        };
+        let state = new_app_state(settings);
+        let mut app = SsdWatchApp::new(state);
+
+        assert!(!app.temp_start_with_windows);
+        assert!(!app.autostart_system_configured);
+
+        // Verify modifying temporary settings and synchronizing
+        app.temp_start_with_windows = true;
+        app.autostart_system_configured = true;
+        assert!(app.temp_start_with_windows);
+        assert!(app.autostart_system_configured);
+
+        app.sync_autostart_with_system();
+        assert_eq!(app.temp_start_with_windows, app.autostart_system_configured);
     }
 }

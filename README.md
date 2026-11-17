@@ -17,7 +17,7 @@ Designed with a focus on efficiency: **single small executable**, **negligible C
 - **System Tray Integration & Silent Window**: Runs natively as a GUI application (`windows_subsystem = "windows"`) with zero command prompt flashing (`CREATE_NO_WINDOW`). Minimizes cleanly to the system tray (`tray-icon`) with context menu options (**Show**, **Quit**).
 - **Diagnostics & Smartctl Resolution**: Multi-stage auto-detection checks custom user paths, system `PATH`, standard `Program Files` installations, and Windows Registry (`HKLM\SOFTWARE\smartmontools`). Built-in Diagnostics panel allows path browsing, re-detection, and inspecting raw outputs.
 - **Rotating File Logger & Crash Hook**: Automatic rotating logging (`<data dir>/estus.log`, rotated at 1 MB) and an uncaught panic hook to capture runtime diagnostics cleanly.
-- **Autostart with Windows**: Native Windows startup registry integration via the `auto-launch` crate.
+- **Autostart with Windows**: Native Windows Task Scheduler integration (`schtasks /Create /RL HIGHEST /SC ONLOGON`) bypassing UAC registry blocks, starting silently to the system tray on logon.
 - **Embedded SQLite Storage**: Built-in SQLite database using WAL mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) in the user data directory, automatically migrating schemas and pruning process writes older than 90 days.
 - **Ultra-low CPU Usage**: Processes are sampled using `sysinfo` with disk-usage-only polling every 30 seconds. The GUI repaints only on data changes or at most once per second, keeping idle CPU near 0%.
 
@@ -92,7 +92,7 @@ src/
 - **UI & Graphics**: `eframe`, `egui`, `egui_plot`
 - **System Monitoring**: `sysinfo`
 - **Storage**: `rusqlite` (with `"bundled"` feature)
-- **Desktop Integration**: `tray-icon`, `notify-rust`, `auto-launch`
+- **Desktop Integration**: `tray-icon`, `notify-rust`, Windows Task Scheduler (`schtasks`)
 - **Serialization & Config**: `serde`, `serde_json`, `directories`
 - **Time & Errors**: `chrono`, `anyhow`
 - **Build Manifest**: `embed-manifest` (requests administrator rights on release builds)

@@ -89,24 +89,19 @@ impl Settings {
         Ok(())
     }
 
-    /// Applies Windows startup configuration using `auto_launch`.
-    pub fn apply_auto_launch(&self) -> Result<()> {
-        let current_exe = std::env::current_exe()?;
-        let app_path = current_exe
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("Invalid executable path"))?;
-
-        let auto = auto_launch::AutoLaunchBuilder::new()
-            .set_app_name("Estus")
-            .set_app_path(app_path)
-            .build()?;
-
+    /// Applies Windows startup configuration using scheduled-task autostart.
+    pub fn apply_autostart(&self) -> Result<()> {
         if self.start_with_windows {
-            auto.enable()?;
+            crate::autostart::enable()?;
         } else {
-            auto.disable()?;
+            crate::autostart::disable()?;
         }
         Ok(())
+    }
+
+    /// Backwards-compatible alias for `apply_autostart`.
+    pub fn apply_auto_launch(&self) -> Result<()> {
+        self.apply_autostart()
     }
 }
 
@@ -133,6 +128,7 @@ pub struct SharedState {
     pub last_raw_output: Option<String>,
     pub active_device: Option<String>,
     pub rescan_requested: bool,
+    pub is_logon_startup: bool,
 }
 
 impl SharedState {
@@ -158,6 +154,7 @@ impl SharedState {
             last_raw_output: None,
             active_device: None,
             rescan_requested: false,
+            is_logon_startup: false,
         }
     }
 
@@ -418,8 +415,13 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
     Ok(())
 }
 
+pub const LOGON_INITIAL_DELAY_SECS: u64 = 20;
+pub const LOGON_RETRY_INTERVAL_SECS: u64 = 5;
+pub const LOGON_MAX_RETRIES: usize = 3;
+
 /// Executes a complete SMART scan and query cycle for all detected and enabled drives.
-pub fn poll_smart_cycle(state: &AppState) {
+/// Returns `true` if drives were successfully discovered and queried, `false` otherwise.
+pub fn poll_smart_cycle(state: &AppState) -> bool {
     let (custom_path, drives_config) = if let Ok(s) = state.lock() {
         (
             s.settings.custom_smartctl_path.clone(),
@@ -446,7 +448,7 @@ pub fn poll_smart_cycle(state: &AppState) {
                 s.last_raw_output = raw_out;
                 s.data_changed = true;
             }
-            return;
+            return false;
         }
     };
 
@@ -460,17 +462,18 @@ pub fn poll_smart_cycle(state: &AppState) {
             let mut per_drive_writes = std::collections::HashMap::new();
             let mut active_drives = Vec::new();
 
-            for (mut drive_info, snapshot) in discovered {
-                if let Some(cfg) = drives_config.get(&drive_info.id) {
-                    drive_info.nickname = cfg.nickname.clone();
-                    drive_info.enabled = cfg.enabled;
+            for (drive_info, snapshot) in &discovered {
+                let mut info = drive_info.clone();
+                if let Some(cfg) = drives_config.get(&info.id) {
+                    info.nickname = cfg.nickname.clone();
+                    info.enabled = cfg.enabled;
                 }
 
                 if let Ok(ref conn) = conn_res {
-                    let _ = crate::db::upsert_drive(conn, &drive_info);
-                    if drive_info.enabled {
-                        let _ = crate::db::insert_snapshot(conn, &drive_info.id, &snapshot);
-                        let daily = crate::db::daily_writes(conn, Some(&drive_info.id), 30).unwrap_or_default();
+                    let _ = crate::db::upsert_drive(conn, &info);
+                    if info.enabled {
+                        let _ = crate::db::insert_snapshot(conn, &info.id, snapshot);
+                        let daily = crate::db::daily_writes(conn, Some(&info.id), 30).unwrap_or_default();
 
                         let today_bytes = daily
                             .iter()
@@ -478,23 +481,23 @@ pub fn poll_smart_cycle(state: &AppState) {
                             .map(|(_, b)| *b)
                             .unwrap_or(0);
 
-                        let drive_label = drive_info
+                        let drive_label = info
                             .nickname
                             .as_deref()
-                            .unwrap_or(&drive_info.model);
+                            .unwrap_or(&info.model);
                         let _ = check_and_send_drive_alert(
                             state,
-                            &drive_info.id,
+                            &info.id,
                             drive_label,
                             today_bytes,
                             today,
                         );
 
-                        per_drive_writes.insert(drive_info.id.clone(), daily);
-                        per_drive_snaps.insert(drive_info.id.clone(), snapshot.clone());
+                        per_drive_writes.insert(info.id.clone(), daily);
+                        per_drive_snaps.insert(info.id.clone(), snapshot.clone());
                     }
                 }
-                active_drives.push(drive_info);
+                active_drives.push(info);
             }
 
             let (all_db_drives, aggregated_daily) = if let Ok(ref conn) = conn_res {
@@ -507,6 +510,7 @@ pub fn poll_smart_cycle(state: &AppState) {
 
             let first_snap = per_drive_snaps.values().next().cloned();
             let active_dev = all_db_drives.first().map(|d| d.device_path.clone());
+            let has_drives = !discovered.is_empty();
 
             if let Ok(mut s) = state.lock() {
                 s.detected_drives = all_db_drives;
@@ -524,6 +528,7 @@ pub fn poll_smart_cycle(state: &AppState) {
                 s.last_raw_error = None;
                 s.data_changed = true;
             }
+            has_drives
         }
         Err(err) => {
             let raw_err = err.to_string();
@@ -535,19 +540,70 @@ pub fn poll_smart_cycle(state: &AppState) {
                 s.last_raw_error = Some(raw_err);
                 s.data_changed = true;
             }
+            false
         }
     }
 }
 
-/// Spawns the SMART Poller thread. Runs immediately, then every 10 minutes.
+/// Spawns the SMART Poller thread. Runs immediately (or delayed at logon startup),
+/// retries on early failure, and then repeats every 10 minutes.
 /// Listens for manual rescan trigger via `rescan_requested`.
-pub fn spawn_smart_poller(state: AppState) -> std::thread::JoinHandle<()> {
+pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::thread::JoinHandle<()> {
     std::thread::Builder::new()
         .name("estus-smart-poller".to_string())
         .spawn(move || {
-            loop {
-                poll_smart_cycle(&state);
+            if is_logon_startup {
+                crate::logger::log(&format!(
+                    "Startup was minimized (logon startup); delaying initial SMART poll by {} seconds for disk drivers to initialize",
+                    LOGON_INITIAL_DELAY_SECS
+                ));
+                for _ in 0..LOGON_INITIAL_DELAY_SECS {
+                    if let Ok(s) = state.lock() {
+                        if s.should_quit {
+                            return;
+                        }
+                        if s.rescan_requested {
+                            break;
+                        }
+                    }
+                    std::thread::sleep(Duration::from_secs(1));
+                }
+            }
 
+            // Initial SMART query
+            let mut success = poll_smart_cycle(&state);
+
+            // If the first SMART query fails during logon startup, retry after 5 seconds up to 3 times
+            if !success && is_logon_startup {
+                for attempt in 1..=LOGON_MAX_RETRIES {
+                    if let Ok(s) = state.lock()
+                        && s.should_quit {
+                            return;
+                        }
+                    crate::logger::log(&format!(
+                        "Initial logon SMART poll failed; retrying in {} seconds (attempt {}/{})",
+                        LOGON_RETRY_INTERVAL_SECS, attempt, LOGON_MAX_RETRIES
+                    ));
+                    for _ in 0..LOGON_RETRY_INTERVAL_SECS {
+                        if let Ok(s) = state.lock() {
+                            if s.should_quit {
+                                return;
+                            }
+                            if s.rescan_requested {
+                                break;
+                            }
+                        }
+                        std::thread::sleep(Duration::from_secs(1));
+                    }
+                    success = poll_smart_cycle(&state);
+                    if success {
+                        crate::logger::log("SMART poll succeeded on retry.");
+                        break;
+                    }
+                }
+            }
+
+            loop {
                 // Sleep for up to 10 minutes (600s), checking rescan_requested and should_quit every 500ms
                 for _ in 0..1200 {
                     if let Ok(mut s) = state.lock() {
@@ -561,6 +617,13 @@ pub fn spawn_smart_poller(state: AppState) -> std::thread::JoinHandle<()> {
                     }
                     std::thread::sleep(Duration::from_millis(500));
                 }
+
+                if let Ok(s) = state.lock()
+                    && s.should_quit {
+                        return;
+                    }
+
+                poll_smart_cycle(&state);
             }
         })
         .expect("Failed to spawn smart poller thread")
@@ -634,9 +697,10 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
 /// Spawns both poller threads and performs startup pruning / state initialization.
 pub fn start_background_threads(
     state: AppState,
+    is_logon_startup: bool,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
     let _ = initialize_database_and_state(&state);
-    let smart_handle = spawn_smart_poller(Arc::clone(&state));
+    let smart_handle = spawn_smart_poller(Arc::clone(&state), is_logon_startup);
     let procs_handle = spawn_procs_poller(Arc::clone(&state));
     (smart_handle, procs_handle)
 }
@@ -703,6 +767,7 @@ mod tests {
         assert_eq!(state.last_raw_output, None);
         assert_eq!(state.active_device, None);
         assert!(!state.rescan_requested);
+        assert!(!state.is_logon_startup);
     }
 
     #[test]
@@ -771,5 +836,25 @@ mod tests {
         // Second check on the same day -> should not fire again
         let res_duplicate = check_and_send_alert(&state, 20_000_000_000, today).unwrap();
         assert!(!res_duplicate);
+    }
+
+    #[test]
+    fn test_logon_startup_constants() {
+        assert_eq!(LOGON_INITIAL_DELAY_SECS, 20);
+        assert_eq!(LOGON_RETRY_INTERVAL_SECS, 5);
+        assert_eq!(LOGON_MAX_RETRIES, 3);
+    }
+
+    #[test]
+    fn test_shared_state_logon_startup_flag() {
+        let settings = Settings::default();
+        let mut state = SharedState::new(settings);
+        assert!(!state.is_logon_startup);
+        assert!(state.show_window);
+
+        state.is_logon_startup = true;
+        state.show_window = false;
+        assert!(state.is_logon_startup);
+        assert!(!state.show_window);
     }
 }

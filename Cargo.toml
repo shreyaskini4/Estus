@@ -5,7 +5,6 @@ edition = "2024"
 
 [dependencies]
 anyhow = "1.0.104"
-auto-launch = "0.6.0"
 chrono = { version = "0.4.45", features = ["serde"] }
 directories = "6.0.0"
 eframe = "0.37.0"
