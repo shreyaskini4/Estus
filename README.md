@@ -99,7 +99,7 @@ src/
 
 ---
 
-## Creating the Executable (.exe)
+## Building & Packaging
 
 ### 1. Prerequisites
 - **Rust Toolchain**: Install Rust via [rustup.rs](https://rustup.rs/) or PowerShell:
@@ -115,7 +115,36 @@ src/
 
 ---
 
-### 2. Build the Standalone Release Binary
+### 2. Strict Release-Only Build Workflow
+> [!IMPORTANT]
+> **Strict Release-Only Rule**: Always build, check, test, and lint using the `--release` flag:
+> - `cargo build --release`
+> - `cargo check --release`
+> - `cargo clippy --release`
+> - `cargo test --release`
+>
+> Debug builds are intentionally disabled (`debug = 0`, `incremental = false` in `Cargo.toml`) to prevent generating unstripped binaries, bloated symbol caches, or massive multi-gigabyte build artifacts. Never run unadorned `cargo build`, `cargo check`, `cargo clippy`, or `cargo test` without `--release`.
+
+---
+
+### 3. External Target Directory
+To prevent gigabytes of intermediate compilation artifacts from cluttering the project workspace or wearing out the repository drive, an external target directory is configured via `.cargo/config.toml`:
+```toml
+[build]
+target-dir = "D:/cargo-target"
+```
+When compiled, all build artifacts and the final executable are placed in:
+```
+D:\cargo-target\release\estus.exe
+```
+The project directory (`d:\projects\ssd watch\`) remains clean of any `target\` directories.
+
+---
+
+### 4. Build the Standalone Release Binary
+> [!WARNING]
+> Before rebuilding, ensure you **quit any running Estus process** from the Windows system tray (right-click the tray icon and select **Quit**). If Estus is currently running, Windows file locking will cause `cargo build --release` to fail during the linking stage with an access denied error.
+
 Navigate to the project root directory and run:
 
 ```powershell
@@ -124,19 +153,19 @@ cargo build --release
 
 Once compilation completes, your standalone executable is ready at:
 ```
-target\release\estus.exe
+D:\cargo-target\release\estus.exe
 ```
 
 ---
 
-### 3. What Makes This Executable Special?
+### 5. What Makes This Executable Special?
 - **Single Self-Contained Binary**: All dependencies (including SQLite via the bundled feature) are compiled directly into `estus.exe` (~17 MB). No external DLLs, Node.js, Electron, or web runtimes are needed.
 - **Embedded Administrator Manifest**: During release builds, `build.rs` automatically embeds a Windows application manifest requesting `requireAdministrator`. When you launch `estus.exe`, Windows automatically prompts for UAC elevation without requiring you to right-click "Run as administrator".
 - **Zero Console Window (`windows_subsystem`)**: Compiled with native Windows GUI subsystem flags. Double-clicking `estus.exe` launches the application directly into the system tray and dashboard without flashing or leaving a command prompt window open.
 
 ---
 
-### 4. Running & Distributing
+### 6. Running & Distributing
 - You can move or copy `estus.exe` anywhere on your machine (e.g., `C:\Program Files\Estus\estus.exe` or your Desktop).
 - Double-click `estus.exe` to run. It will minimize to your system tray on window close and continue background monitoring.
 - Diagnostics and execution logs are stored at `%LOCALAPPDATA%\estus\Estus\data\estus.log`.
@@ -145,14 +174,21 @@ target\release\estus.exe
 
 ## Development & Verification
 
+Always include the `--release` flag for all cargo operations:
+
+### Run Checks
+```powershell
+cargo check --release
+```
+
 ### Run Tests
 ```powershell
-cargo test
+cargo test --release
 ```
 
 ### Run Clippy Linter
 ```powershell
-cargo clippy --all-targets -- -D warnings
+cargo clippy --release --all-targets -- -D warnings
 ```
 
 ---

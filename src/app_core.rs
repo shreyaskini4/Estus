@@ -30,6 +30,8 @@ pub struct Settings {
     pub custom_smartctl_path: Option<String>,
     #[serde(default)]
     pub drives: std::collections::HashMap<String, DriveConfig>,
+    #[serde(default)]
+    pub verbose_logging: bool,
 }
 
 impl Default for Settings {
@@ -40,6 +42,7 @@ impl Default for Settings {
             last_notified_date: None,
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
+            verbose_logging: false,
         }
     }
 }
@@ -56,20 +59,26 @@ impl Settings {
         if let Some(path) = settings_path() {
             Self::load_from_path(&path)
         } else {
-            Self::default()
+            let def = Self::default();
+            crate::logger::set_verbose_logging(def.verbose_logging);
+            def
         }
     }
 
     /// Loads settings from a specified file path. Returns default on error or nonexistence.
     pub fn load_from_path(path: &Path) -> Self {
         if !path.exists() {
-            return Self::default();
+            let def = Self::default();
+            crate::logger::set_verbose_logging(def.verbose_logging);
+            return def;
         }
 
-        match std::fs::read_to_string(path) {
+        let settings: Self = match std::fs::read_to_string(path) {
             Ok(content) => serde_json::from_str(&content).unwrap_or_default(),
             Err(_) => Self::default(),
-        }
+        };
+        crate::logger::set_verbose_logging(settings.verbose_logging);
+        settings
     }
 
     /// Persists settings to standard `settings.json`.
@@ -86,6 +95,7 @@ impl Settings {
         }
         let json = serde_json::to_string_pretty(self)?;
         std::fs::write(path, json)?;
+        crate::logger::set_verbose_logging(self.verbose_logging);
         Ok(())
     }
 
@@ -133,6 +143,7 @@ pub struct SharedState {
 
 impl SharedState {
     pub fn new(settings: Settings) -> Self {
+        crate::logger::set_verbose_logging(settings.verbose_logging);
         Self {
             detected_drives: Vec::new(),
             selected_drive_id: None,
@@ -235,11 +246,11 @@ pub fn check_and_send_drive_alert(
     {
         let today_gb = today_bytes as f64 / crate::analytics::BYTES_PER_GB;
         if let Err(e) = fire_drive_notification(drive_name, today_gb, threshold_gb) {
-            crate::logger::log(&format!("Failed to display notification: {e}"));
+            crate::logger::log_warn(&format!("Failed to display notification: {e}"));
         }
         state_guard.settings.last_notified_date = Some(today_date);
         if let Err(e) = state_guard.settings.save() {
-            crate::logger::log(&format!("Failed to save settings with updated notification date: {e}"));
+            crate::logger::log_error(&format!("Failed to save settings with updated notification date: {e}"));
         }
         return Ok(true);
     }
@@ -261,11 +272,11 @@ pub fn check_and_send_alert(
         && state_guard.settings.last_notified_date != Some(today_date) {
             let today_gb = today_bytes as f64 / crate::analytics::BYTES_PER_GB;
             if let Err(e) = fire_notification(today_gb, threshold_gb) {
-                crate::logger::log(&format!("Failed to display notification: {e}"));
+                crate::logger::log_warn(&format!("Failed to display notification: {e}"));
             }
             state_guard.settings.last_notified_date = Some(today_date);
             if let Err(e) = state_guard.settings.save() {
-                crate::logger::log(&format!("Failed to save settings with updated notification date: {e}"));
+                crate::logger::log_error(&format!("Failed to save settings with updated notification date: {e}"));
             }
             return Ok(true);
         }
@@ -321,13 +332,13 @@ pub fn handle_tray_events(
 
     while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
         if event.id == *show_id {
-            crate::logger::log("Tray menu: Show requested");
+            crate::logger::log_info("Tray menu: Show requested");
             if let Ok(mut s) = state.lock() {
                 s.show_window = true;
             }
             show_requested = true;
         } else if event.id == *quit_id {
-            crate::logger::log("Tray menu: Quit clicked. Terminating application.");
+            crate::logger::log_info("Tray menu: Quit clicked. Terminating application.");
             if let Ok(mut s) = state.lock() {
                 s.should_quit = true;
             }
@@ -338,7 +349,7 @@ pub fn handle_tray_events(
     while let Ok(event) = tray_icon::TrayIconEvent::receiver().try_recv() {
         match event {
             tray_icon::TrayIconEvent::DoubleClick { .. } => {
-                crate::logger::log("Tray icon double-clicked: showing window");
+                crate::logger::log_info("Tray icon double-clicked: showing window");
                 if let Ok(mut s) = state.lock() {
                     s.show_window = true;
                 }
@@ -348,7 +359,7 @@ pub fn handle_tray_events(
                 button: tray_icon::MouseButton::Left,
                 ..
             } => {
-                crate::logger::log("Tray icon left-clicked: showing window");
+                crate::logger::log_info("Tray icon left-clicked: showing window");
                 if let Ok(mut s) = state.lock() {
                     s.show_window = true;
                 }
@@ -366,7 +377,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
     let conn = crate::db::init_db()?;
 
     if let Err(e) = crate::db::prune_old_records(&conn, 90) {
-        crate::logger::log(&format!("Warning: Failed to prune old database records: {e}"));
+        crate::logger::log_warn(&format!("Warning: Failed to prune old database records: {e}"));
     }
 
     let drives = crate::db::get_drives(&conn)?;
@@ -422,6 +433,7 @@ pub const LOGON_MAX_RETRIES: usize = 3;
 /// Executes a complete SMART scan and query cycle for all detected and enabled drives.
 /// Returns `true` if drives were successfully discovered and queried, `false` otherwise.
 pub fn poll_smart_cycle(state: &AppState) -> bool {
+    crate::logger::log_debug("Beginning routine SMART polling cycle");
     let (custom_path, drives_config) = if let Ok(s) = state.lock() {
         (
             s.settings.custom_smartctl_path.clone(),
@@ -512,6 +524,11 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
             let active_dev = all_db_drives.first().map(|d| d.device_path.clone());
             let has_drives = !discovered.is_empty();
 
+            crate::logger::log_debug(&format!(
+                "Routine SMART polling cycle completed: {} drive(s) queried",
+                discovered.len()
+            ));
+
             if let Ok(mut s) = state.lock() {
                 s.detected_drives = all_db_drives;
                 s.per_drive_snapshots = per_drive_snaps;
@@ -553,7 +570,7 @@ pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::threa
         .name("estus-smart-poller".to_string())
         .spawn(move || {
             if is_logon_startup {
-                crate::logger::log(&format!(
+                crate::logger::log_info(&format!(
                     "Startup was minimized (logon startup); delaying initial SMART poll by {} seconds for disk drivers to initialize",
                     LOGON_INITIAL_DELAY_SECS
                 ));
@@ -580,7 +597,7 @@ pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::threa
                         && s.should_quit {
                             return;
                         }
-                    crate::logger::log(&format!(
+                    crate::logger::log_warn(&format!(
                         "Initial logon SMART poll failed; retrying in {} seconds (attempt {}/{})",
                         LOGON_RETRY_INTERVAL_SECS, attempt, LOGON_MAX_RETRIES
                     ));
@@ -597,7 +614,7 @@ pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::threa
                     }
                     success = poll_smart_cycle(&state);
                     if success {
-                        crate::logger::log("SMART poll succeeded on retry.");
+                        crate::logger::log_info("SMART poll succeeded on retry.");
                         break;
                     }
                 }
@@ -717,6 +734,7 @@ mod tests {
         assert_eq!(s.last_notified_date, None);
         assert_eq!(s.custom_smartctl_path, None);
         assert!(s.drives.is_empty());
+        assert!(!s.verbose_logging);
     }
 
     #[test]
@@ -735,12 +753,14 @@ mod tests {
             last_notified_date: NaiveDate::from_ymd_opt(2026, 11, 16),
             custom_smartctl_path: Some(r"C:\bin\smartctl.exe".to_string()),
             drives,
+            verbose_logging: true,
         };
 
         let json = serde_json::to_string(&s).unwrap();
         let loaded: Settings = serde_json::from_str(&json).unwrap();
         assert_eq!(s, loaded);
         assert_eq!(loaded.drives.get("drive1").unwrap().nickname, Some("OS SSD".to_string()));
+        assert!(loaded.verbose_logging);
     }
 
     #[test]
@@ -816,6 +836,7 @@ mod tests {
             last_notified_date: None,
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
+            verbose_logging: false,
         };
         let state = new_app_state(settings);
         let today = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
@@ -856,5 +877,33 @@ mod tests {
         state.show_window = false;
         assert!(state.is_logon_startup);
         assert!(!state.show_window);
+    }
+
+    #[test]
+    fn test_verbose_logging_setting_sync() {
+        let temp_dir = std::env::temp_dir();
+        let path = temp_dir.join(format!("estus_verbose_test_{}.json", std::process::id()));
+
+        // Save with verbose_logging = true
+        let mut s = Settings {
+            verbose_logging: true,
+            ..Default::default()
+        };
+        s.save_to_path(&path).unwrap();
+
+        // Loading should automatically update the logger active level
+        let loaded = Settings::load_from_path(&path);
+        assert!(loaded.verbose_logging);
+        assert!(crate::logger::is_verbose_logging());
+
+        // Update to false and save
+        s.verbose_logging = false;
+        s.save_to_path(&path).unwrap();
+
+        let loaded_false = Settings::load_from_path(&path);
+        assert!(!loaded_false.verbose_logging);
+        assert!(!crate::logger::is_verbose_logging());
+
+        let _ = std::fs::remove_file(&path);
     }
 }

@@ -174,6 +174,10 @@ pub fn run_proc_collector_loop(
 
         let deltas = collector.poll_deltas();
         if !deltas.is_empty() {
+            crate::logger::log_debug(&format!(
+                "Process monitor poll collected {} active process writer(s)",
+                deltas.len()
+            ));
             let ts = chrono::Utc::now().timestamp();
             if let Ok(c) = conn.lock() {
                 let _ = crate::db::insert_process_deltas(&c, ts, &deltas);
@@ -193,7 +197,7 @@ pub fn spawn_proc_monitor_thread(
         .name("ssd-watch-proc-monitor".to_string())
         .spawn(move || {
             if let Err(e) = run_proc_collector_loop(conn, shutdown_signal, interval) {
-                crate::logger::log(&format!("Process monitor thread encountered error: {e}"));
+                crate::logger::log_error(&format!("Process monitor thread encountered error: {e}"));
             }
         })
         .expect("failed to spawn proc monitor thread")
@@ -329,6 +333,6 @@ mod tests {
         let mut collector = ProcCollector::new();
         let deltas = collector.poll_deltas();
         // Should execute without panicking; deltas could be empty or non-empty depending on system activity
-        crate::logger::log(&format!("Collected {} process deltas in test", deltas.len()));
+        crate::logger::log_debug(&format!("Collected {} process deltas in test", deltas.len()));
     }
 }

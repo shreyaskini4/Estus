@@ -21,3 +21,14 @@ windows-registry = "0.100.0"
 
 [build-dependencies]
 embed-manifest = "1.5.1"
+
+[profile.dev]
+debug = 0
+incremental = false
+
+[profile.release]
+opt-level = "s"
+lto = true
+strip = true
+panic = "abort"
+codegen-units = 1

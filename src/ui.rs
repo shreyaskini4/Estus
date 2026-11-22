@@ -108,6 +108,7 @@ pub struct SsdWatchApp {
     pub temp_start_with_windows: bool,
     pub autostart_system_configured: bool,
     pub temp_custom_smartctl_path: String,
+    pub temp_verbose_logging: bool,
     pub temp_drive_nicknames: std::collections::HashMap<String, String>,
     pub temp_drive_enabled: std::collections::HashMap<String, bool>,
     pub settings_status_msg: Option<(String, bool)>,
@@ -118,14 +119,15 @@ pub struct SsdWatchApp {
 
 impl SsdWatchApp {
     pub fn new(state: AppState) -> Self {
-        let (threshold, _start_with_win, custom_path) = if let Ok(s) = state.lock() {
+        let (threshold, _start_with_win, custom_path, verbose_logging) = if let Ok(s) = state.lock() {
             (
                 s.settings.alert_threshold_gb,
                 s.settings.start_with_windows,
                 s.settings.custom_smartctl_path.clone().unwrap_or_default(),
+                s.settings.verbose_logging,
             )
         } else {
-            (100.0, false, String::new())
+            (100.0, false, String::new(), false)
         };
 
         // Query actual system state from Windows Task Scheduler rather than solely trusting JSON
@@ -147,6 +149,7 @@ impl SsdWatchApp {
             temp_start_with_windows: system_autostart,
             autostart_system_configured: system_autostart,
             temp_custom_smartctl_path: custom_path,
+            temp_verbose_logging: verbose_logging,
             temp_drive_nicknames: std::collections::HashMap::new(),
             temp_drive_enabled: std::collections::HashMap::new(),
             settings_status_msg: None,
@@ -1326,6 +1329,15 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
                     .color(Color32::from_rgb(140, 145, 160)),
                 );
 
+                ui.add_space(6.0);
+
+                ui.horizontal(|ui| {
+                    ui.checkbox(
+                        &mut app.temp_verbose_logging,
+                        "Verbose logging (include debug traces for troubleshooting)",
+                    );
+                });
+
                 ui.add_space(10.0);
                 ui.separator();
                 ui.add_space(6.0);
@@ -1399,6 +1411,8 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
                         if let Ok(mut s) = app.state.lock() {
                             s.settings.alert_threshold_gb = app.temp_alert_threshold;
                             s.settings.start_with_windows = app.temp_start_with_windows;
+                            s.settings.verbose_logging = app.temp_verbose_logging;
+                            crate::logger::set_verbose_logging(app.temp_verbose_logging);
                             s.settings.custom_smartctl_path = if app.temp_custom_smartctl_path.trim().is_empty() {
                                 None
                             } else {
@@ -1574,6 +1588,7 @@ mod tests {
             last_notified_date: None,
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
+            verbose_logging: true,
         };
         let state = new_app_state(settings);
         let app = SsdWatchApp::new(state);
@@ -1582,6 +1597,7 @@ mod tests {
         assert!((app.temp_alert_threshold - 75.0).abs() < 1e-6);
         assert!(app.temp_start_with_windows);
         assert!(app.autostart_system_configured);
+        assert!(app.temp_verbose_logging);
         assert_eq!(app.settings_status_msg, None);
     }
 
@@ -1593,6 +1609,7 @@ mod tests {
             last_notified_date: None,
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
+            verbose_logging: false,
         };
         let state = new_app_state(settings);
         let app = SsdWatchApp::new(state);
@@ -1601,6 +1618,7 @@ mod tests {
         assert!((app.temp_alert_threshold - 50.0).abs() < 1e-6);
         assert!(!app.temp_start_with_windows);
         assert!(!app.autostart_system_configured);
+        assert!(!app.temp_verbose_logging);
         assert_eq!(app.settings_status_msg, None);
     }
 
@@ -1612,18 +1630,22 @@ mod tests {
             last_notified_date: None,
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
+            verbose_logging: false,
         };
         let state = new_app_state(settings);
         let mut app = SsdWatchApp::new(state);
 
         assert!(!app.temp_start_with_windows);
         assert!(!app.autostart_system_configured);
+        assert!(!app.temp_verbose_logging);
 
         // Verify modifying temporary settings and synchronizing
         app.temp_start_with_windows = true;
         app.autostart_system_configured = true;
+        app.temp_verbose_logging = true;
         assert!(app.temp_start_with_windows);
         assert!(app.autostart_system_configured);
+        assert!(app.temp_verbose_logging);
 
         app.sync_autostart_with_system();
         assert_eq!(app.temp_start_with_windows, app.autostart_system_configured);

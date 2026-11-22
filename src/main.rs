@@ -18,7 +18,7 @@ fn main() -> eframe::Result<()> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |panic_info| {
         let panic_msg = crate::logger::format_panic_info(panic_info);
-        crate::logger::log(&panic_msg);
+        crate::logger::log_error(&panic_msg);
         default_hook(panic_info);
     }));
 
@@ -28,7 +28,7 @@ fn main() -> eframe::Result<()> {
     // Inspect CLI arguments for startup flags
     let start_minimized = std::env::args().any(|arg| arg == "--minimized");
 
-    crate::logger::log(&format!(
+    crate::logger::log_info(&format!(
         "Estus starting up (minimized: {})",
         start_minimized
     ));
@@ -80,7 +80,7 @@ fn main() -> eframe::Result<()> {
                             break;
                         }
                     if act_guard.wait_for_activation(200) {
-                        crate::logger::log("Activation signal received; unhiding and focusing window");
+                        crate::logger::log_info("Activation signal received; unhiding and focusing window");
                         if let Ok(mut s) = act_state.lock() {
                             s.show_window = true;
                         }
@@ -128,7 +128,7 @@ fn main() -> eframe::Result<()> {
     drop(single_instance_main);
 
     if let Err(ref e) = res {
-        crate::logger::log(&format!("eframe::run_native returned error: {e}"));
+        crate::logger::log_error(&format!("eframe::run_native returned error: {e}"));
     }
     res
 }

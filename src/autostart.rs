@@ -124,13 +124,13 @@ fn run_schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
     let mut cmd = crate::process_util::create_no_window_command("schtasks");
     cmd.args(args);
     let full_cmd_str = format!("schtasks {}", args.join(" "));
-    crate::logger::log(&format!("Executing: {}", full_cmd_str));
+    crate::logger::log_debug(&format!("Executing: {}", full_cmd_str));
 
     match cmd.output() {
         Ok(output) => {
             let stdout = String::from_utf8_lossy(&output.stdout);
             let stderr = String::from_utf8_lossy(&output.stderr);
-            crate::logger::log(&format!(
+            crate::logger::log_debug(&format!(
                 "Result for [{}]: status={}, stdout={}, stderr={}",
                 full_cmd_str,
                 output.status,
@@ -140,7 +140,7 @@ fn run_schtasks(args: &[&str]) -> std::io::Result<std::process::Output> {
             Ok(output)
         }
         Err(e) => {
-            crate::logger::log(&format!(
+            crate::logger::log_error(&format!(
                 "Failed to execute [{}]: {}",
                 full_cmd_str, e
             ));
@@ -225,7 +225,7 @@ pub fn create_task_direct(exe_path: &str) -> Result<()> {
         anyhow::bail!("Direct schtasks creation failed: {}", stderr.trim());
     }
 
-    crate::logger::log("Successfully configured autostart task via direct schtasks command");
+    crate::logger::log_info("Successfully configured autostart task via direct schtasks command");
     Ok(())
 }
 
@@ -240,11 +240,11 @@ pub fn enable() -> Result<()> {
 
     match create_task_from_xml(exe_path) {
         Ok(()) => {
-            crate::logger::log("Successfully configured autostart task via XML");
+            crate::logger::log_info("Successfully configured autostart task via XML");
             Ok(())
         }
         Err(e) => {
-            crate::logger::log(&format!(
+            crate::logger::log_warn(&format!(
                 "Failed to configure autostart task via XML: {}. Falling back to direct schtasks command.",
                 e
             ));
@@ -304,7 +304,7 @@ pub fn sync_task_if_path_changed() -> Result<bool> {
     let configured_cmd = match get_task_command() {
         Some(cmd) => cmd,
         None => {
-            crate::logger::log(
+            crate::logger::log_warn(
                 "Autostart task is enabled but executable command could not be parsed; recreating task",
             );
             enable()?;
@@ -322,7 +322,7 @@ pub fn sync_task_if_path_changed() -> Result<bool> {
     };
 
     if needs_update {
-        crate::logger::log(&format!(
+        crate::logger::log_info(&format!(
             "Autostart task executable path changed from '{}' to '{}'; updating task",
             configured_cmd, current_exe_str
         ));

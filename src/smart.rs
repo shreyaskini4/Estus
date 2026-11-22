@@ -275,7 +275,7 @@ fn check_and_accept(
     tried.push(p.display().to_string());
 
     if let Some(ver) = verify_candidate(&p) {
-        crate::logger::log(&format!(
+        crate::logger::log_info(&format!(
             "Candidate verified successfully: \"{}\" (version: {})",
             p.display(),
             ver
@@ -371,7 +371,7 @@ pub fn resolve_smartctl(custom_path: Option<&str>) -> Option<PathBuf> {
             }
     }
 
-    crate::logger::log(&format!(
+    crate::logger::log_warn(&format!(
         "smartctl detection failed after checking candidates: {tried:?}"
     ));
     None
@@ -899,14 +899,14 @@ pub fn discover_and_query_all_drives(
     for dev in &devices {
         match query_device(&smartctl_exe, dev) {
             Ok((drive_info, snapshot)) => {
-                crate::logger::log(&format!(
+                crate::logger::log_info(&format!(
                     "Discovered drive: ID=\"{}\", model=\"{}\", path=\"{}\"",
                     drive_info.id, drive_info.model, drive_info.device_path
                 ));
                 results.push((drive_info, snapshot));
             }
             Err(err) => {
-                crate::logger::log(&format!(
+                crate::logger::log_warn(&format!(
                     "Gracefully skipping device \"{dev}\" after query failed: {err}"
                 ));
                 last_err = Some(err);

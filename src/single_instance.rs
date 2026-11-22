@@ -133,7 +133,7 @@ pub fn try_acquire_single_instance(mutex_name: &str, event_name: &str) -> Single
         }
 
         if mutex.is_null() {
-            crate::logger::log(&format!("Warning: CreateMutexW returned null, error={}", err));
+            crate::logger::log_warn(&format!("Warning: CreateMutexW returned null, error={}", err));
         }
 
         let event_w = to_wide(event_name);
@@ -181,7 +181,7 @@ pub fn acquire_or_activate() -> SingleInstanceGuard {
     match try_acquire_single_instance(DEFAULT_MUTEX_NAME, DEFAULT_EVENT_NAME) {
         SingleInstanceResult::Acquired(guard) => guard,
         SingleInstanceResult::AlreadyRunning => {
-            crate::logger::log("Another instance of Estus is already running. Bringing it forward and exiting.");
+            crate::logger::log_info("Another instance of Estus is already running. Bringing it forward and exiting.");
             activate_existing_instance(DEFAULT_EVENT_NAME);
             std::process::exit(0);
         }
