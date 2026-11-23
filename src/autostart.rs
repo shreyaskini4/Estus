@@ -288,11 +288,11 @@ pub fn get_task_command() -> Option<String> {
     None
 }
 
-/// If the scheduled task is enabled but points to a different executable path than `std::env::current_exe()`,
-/// updates/recreates the scheduled task to point to the current executable.
-/// Returns `Ok(true)` if the task was updated, `Ok(false)` if no change was needed or task was disabled.
-pub fn sync_task_if_path_changed() -> Result<bool> {
-    if !is_enabled() {
+/// If "Start with Windows" is enabled in settings and the scheduled task currently points to a different
+/// exe path than `current_exe()` (or the task is missing/corrupted), recreates the task to point to `current_exe()`.
+/// Returns `Ok(true)` if the task was updated/created, `Ok(false)` if no change was needed or feature is disabled.
+pub fn sync_task_with_settings(start_with_windows: bool) -> Result<bool> {
+    if !start_with_windows {
         return Ok(false);
     }
 
@@ -304,8 +304,8 @@ pub fn sync_task_if_path_changed() -> Result<bool> {
     let configured_cmd = match get_task_command() {
         Some(cmd) => cmd,
         None => {
-            crate::logger::log_warn(
-                "Autostart task is enabled but executable command could not be parsed; recreating task",
+            crate::logger::log_info(
+                "Autostart is enabled in settings but scheduled task is missing or invalid; creating task",
             );
             enable()?;
             return Ok(true);
@@ -331,6 +331,12 @@ pub fn sync_task_if_path_changed() -> Result<bool> {
     } else {
         Ok(false)
     }
+}
+
+/// Inspects application settings to determine if startup task needs syncing.
+pub fn sync_task_if_path_changed() -> Result<bool> {
+    let settings = crate::app_core::Settings::load();
+    sync_task_with_settings(settings.start_with_windows)
 }
 
 #[cfg(test)]
@@ -463,5 +469,11 @@ Scheduled Task State:                 Enabled
             true,
             "Folder: \\\nStatus: Running"
         ));
+    }
+
+    #[test]
+    fn test_sync_task_with_settings_when_disabled() {
+        let res = sync_task_with_settings(false);
+        assert!(!res.unwrap());
     }
 }

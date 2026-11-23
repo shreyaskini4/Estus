@@ -26,10 +26,10 @@ Designed with a focus on efficiency: **single small executable**, **negligible C
 ## Installation & Setup
 
 ### 1. Install `smartmontools`
-SSD Watch uses `smartctl` to read low-level NVMe SMART health metrics. Install it via Windows Package Manager (`winget`):
+Estus uses `smartctl` to read low-level NVMe SMART health metrics. Install it via Windows Package Manager (`winget`):
 
 ```powershell
-winget install smartmontools
+winget install smartmontools.smartmontools
 ```
 
 *Alternatively, download the installer directly from [smartmontools.org](https://www.smartmontools.org/) and ensure `smartctl.exe` is in your system `PATH`.*
@@ -44,7 +44,7 @@ Accessing raw NVMe hardware SMART logs on Windows requires elevated administrato
 ## How the Numbers Are Measured
 
 ### 1. NVMe SMART Metrics (`smartctl`)
-SSD Watch queries `smartctl -j -a /dev/nvme0` every 10 minutes in the background without spawning console windows (`CREATE_NO_WINDOW` flag):
+Estus queries `smartctl -j -a /dev/nvme0` every 10 minutes in the background without spawning console windows (`CREATE_NO_WINDOW` flag):
 - **Data Units Written & Read**: Read directly from the NVMe `nvme_smart_health_information_log`. According to the official NVM Express specification, **1 Data Unit = 1,000 × 512 bytes = 512,000 bytes** (~500 KiB). Total host bytes are calculated as:
   $$\text{Host Bytes Written} = \text{data\_units\_written} \times 512{,}000$$
 - **Percentage Used**: Vendor-reported drive wear indicator. `0%` indicates a brand-new drive; `100%` indicates that the drive has reached its rated endurance (TBW). Note that reaching 100% does not imply immediate drive failure, but that the manufacturer's endurance warranty threshold has been reached.
@@ -99,26 +99,79 @@ src/
 
 ---
 
-## Building & Packaging
+## Building from Source
 
-### 1. Prerequisites
-- **Rust Toolchain**: Install Rust via [rustup.rs](https://rustup.rs/) or PowerShell:
-  ```powershell
-  winget install --id Rustlang.Rustup
-  ```
-  *(Restart your terminal after installation so `cargo` is in your `PATH`)*
-- **C++ Build Tools**: Visual Studio C++ Build Tools (MSVC toolchain).
-- **smartmontools**: Required at runtime to query drive telemetry:
-  ```powershell
-  winget install smartmontools
-  ```
+Estus is designed to be fully portable and easy to build on any 64-bit Windows machine. You can set up and build using our automated scripts or manually configure your environment.
+
+### 1. Quick Path (Automated Scripts)
+
+The fastest and most reliable way to prepare your machine and compile Estus:
+
+1. **Install All Dependencies**:
+   - Double-click `setup.bat` (or run `.\setup.ps1` in PowerShell as administrator).
+   - This script checks for and installs all required dependencies via Windows Package Manager (`winget`):
+     - **Git**
+     - **Rust** (via `rustup` with the `stable-x86_64-pc-windows-msvc` toolchain)
+     - **Visual Studio C++ Build Tools** (MSVC compiler, Windows 10/11 SDK, Desktop C++ workload)
+     - **smartmontools** (for `smartctl`)
+2. **Build the Release Executable**:
+   - Run `.\build.ps1` in PowerShell:
+     ```powershell
+     .\build.ps1
+     ```
+   - The script verifies prerequisites, detects whether Estus is running, sets up target paths, and executes `cargo build --release`.
+
+#### Script Exit Codes
+The automation scripts (`setup.ps1` and `build.ps1`) use standardized exit codes:
+- `0`: Success
+- `1`: General Failure
+- `2`: Missing Dependency (e.g., Rust or VS C++ Build Tools not found)
+- `3`: Elevation Required (script must be run as Administrator)
+- `4`: App Running (an instance of `estus.exe` is running and locking the executable)
 
 ---
 
-### 2. Strict Release-Only Build Workflow
+### 2. Manual Path
+
+If you prefer to configure your environment manually:
+
+1. **Install Rust**:
+   - Install Rust via [rustup.rs](https://rustup.rs/) using the MSVC toolchain (`stable-x86_64-pc-windows-msvc`):
+     ```powershell
+     winget install --id Rustlang.Rustup
+     ```
+   - Verify `cargo` is available in your shell:
+     ```powershell
+     rustup default stable-x86_64-pc-windows-msvc
+     ```
+   - Ensure `%USERPROFILE%\.cargo\bin` is in your `PATH` (restart your terminal if needed).
+
+2. **Install Visual Studio C++ Build Tools**:
+   - Install Visual Studio Build Tools with the **"Desktop development with C++"** workload (including MSVC compiler and Windows SDK):
+     ```powershell
+     winget install Microsoft.VisualStudio.2022.BuildTools
+     ```
+
+3. **Install `smartmontools`**:
+   - Install via `winget`:
+     ```powershell
+     winget install smartmontools.smartmontools
+     ```
+   - *Alternatively, download from [smartmontools.org](https://www.smartmontools.org/) and ensure `smartctl.exe` is in your `PATH`.*
+
+4. **Build the Standalone Release Binary**:
+   - Navigate to the project root directory and run:
+     ```powershell
+     cargo build --release
+     ```
+
+---
+
+### 3. Strict Release-Only Build Workflow
+
 > [!IMPORTANT]
 > **Strict Release-Only Rule**: Always build, check, test, and lint using the `--release` flag:
-> - `cargo build --release`
+> - `cargo build --release` (or `.\build.ps1`)
 > - `cargo check --release`
 > - `cargo clippy --release`
 > - `cargo test --release`
@@ -127,45 +180,58 @@ src/
 
 ---
 
-### 3. External Target Directory
-To prevent gigabytes of intermediate compilation artifacts from cluttering the project workspace or wearing out the repository drive, an external target directory is configured via `.cargo/config.toml`:
-```toml
-[build]
-target-dir = "D:/cargo-target"
-```
-When compiled, all build artifacts and the final executable are placed in:
-```
-D:\cargo-target\release\estus.exe
-```
-The project directory (`d:\projects\ssd watch\`) remains clean of any `target\` directories.
+### 4. Build Output & Custom Target Directory
 
----
+By default, Cargo outputs the compiled executable to the local `target` directory:
+```
+target\release\estus.exe
+```
 
-### 4. Build the Standalone Release Binary
-> [!WARNING]
-> Before rebuilding, ensure you **quit any running Estus process** from the Windows system tray (right-click the tray icon and select **Quit**). If Estus is currently running, Windows file locking will cause `cargo build --release` to fail during the linking stage with an access denied error.
-
-Navigate to the project root directory and run:
+#### Storing Build Artifacts Externally (`ESTUS_TARGET_DIR`)
+Intermediate Rust compilation artifacts can consume several gigabytes of disk space and generate significant disk write volume. If you wish to store build artifacts on a separate drive or dedicated cache directory, set the `ESTUS_TARGET_DIR` environment variable before building:
 
 ```powershell
+# Point to a dedicated directory or separate drive (e.g. D:\cargo-target)
+$env:ESTUS_TARGET_DIR = "D:\cargo-target"
+.\build.ps1
+```
+
+Or when running Cargo directly:
+```powershell
+$env:CARGO_TARGET_DIR = "D:\cargo-target"
 cargo build --release
 ```
 
-Once compilation completes, your standalone executable is ready at:
+When configured, the final executable will be located at:
 ```
-D:\cargo-target\release\estus.exe
+<custom-target-dir>\release\estus.exe
 ```
 
 ---
 
-### 5. What Makes This Executable Special?
+### 5. Administrator Rights & Rebuilding Notes
+
+- **Administrator Privileges Manifest**:
+  Estus automatically embeds a Windows application manifest (`requireAdministrator`) into release builds. When launched, Windows displays the UAC prompt to request elevated privileges. This is necessary to communicate with physical NVMe controllers, query SMART health telemetry, and configure autostart via Windows Task Scheduler (`schtasks`).
+- **File Locking During Rebuilds (`Access is denied`)**:
+  Because Estus runs in the background and minimizes to the system notification tray, the binary (`estus.exe`) remains open and locked by the Windows kernel. Attempting to recompile while Estus is running will fail at the link stage with:
+  ```
+  error: could not copy "..." to "...": Access is denied. (os error 5)
+  ```
+  **Always right-click the Estus tray icon and choose "Quit" before rebuilding.**
+
+---
+
+### 6. What Makes This Executable Special?
+
 - **Single Self-Contained Binary**: All dependencies (including SQLite via the bundled feature) are compiled directly into `estus.exe` (~17 MB). No external DLLs, Node.js, Electron, or web runtimes are needed.
-- **Embedded Administrator Manifest**: During release builds, `build.rs` automatically embeds a Windows application manifest requesting `requireAdministrator`. When you launch `estus.exe`, Windows automatically prompts for UAC elevation without requiring you to right-click "Run as administrator".
-- **Zero Console Window (`windows_subsystem`)**: Compiled with native Windows GUI subsystem flags. Double-clicking `estus.exe` launches the application directly into the system tray and dashboard without flashing or leaving a command prompt window open.
+- **Embedded Administrator Manifest**: Automatically requests `requireAdministrator` without requiring you to manually right-click "Run as administrator".
+- **Zero Console Window (`windows_subsystem`)**: Compiled with native Windows GUI subsystem flags. Double-clicking `estus.exe` launches directly into the dashboard and system tray without flashing a command prompt window (`CREATE_NO_WINDOW`).
 
 ---
 
-### 6. Running & Distributing
+### 7. Running & Distributing
+
 - You can move or copy `estus.exe` anywhere on your machine (e.g., `C:\Program Files\Estus\estus.exe` or your Desktop).
 - Double-click `estus.exe` to run. It will minimize to your system tray on window close and continue background monitoring.
 - Diagnostics and execution logs are stored at `%LOCALAPPDATA%\estus\Estus\data\estus.log`.
@@ -190,6 +256,21 @@ cargo test --release
 ```powershell
 cargo clippy --release --all-targets -- -D warnings
 ```
+
+---
+
+## Troubleshooting
+
+Common issues and their solutions when setting up, building, or running Estus:
+
+| Issue | Cause | Solution |
+| :--- | :--- | :--- |
+| **`cargo : The term 'cargo' is not recognized`** | Rust is not installed, or `cargo` is not in your current shell's `PATH`. | Run `setup.bat` (or `setup.ps1`), or manually add `%USERPROFILE%\.cargo\bin` to your system `PATH` and restart your terminal. |
+| **`link.exe not found`** | The MSVC C++ linker or Windows SDK is missing. | Install Visual Studio C++ Build Tools and select the **"Desktop development with C++"** workload. |
+| **`Access is denied (os error 5)`** | Estus is currently running, locking `estus.exe` from being overwritten. | Right-click the Estus icon in the Windows system tray and select **Quit** before running `build.ps1` or `cargo build --release`. |
+| **`smartctl not detected`** | `smartctl.exe` is not installed or not in your `PATH` or registry. | Run `winget install smartmontools.smartmontools` or download the installer from [smartmontools.org](https://www.smartmontools.org/). Alternatively, open the **Diagnostics** panel inside Estus and click **Browse...** to select your `smartctl.exe` binary. |
+| **`winget : The term 'winget' is not recognized`** | Windows Package Manager is not present on this Windows installation. | Install **App Installer** from the Microsoft Store, or download the latest `.msixbundle` from the official [winget-cli GitHub repository](https://github.com/microsoft/winget-cli). |
+| **`running scripts is disabled on this system`** | PowerShell script execution policy restricts running `.ps1` files. | Run `setup.bat` directly (which automatically executes PowerShell with `-ExecutionPolicy Bypass`), or run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in your PowerShell terminal. |
 
 ---
 

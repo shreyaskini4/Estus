@@ -346,21 +346,25 @@ pub fn resolve_smartctl(custom_path: Option<&str>) -> Option<PathBuf> {
         }
     }
 
-    // 3. C:\Program Files\smartmontools\bin\smartctl.exe
-    let p3 = PathBuf::from(r"C:\Program Files\smartmontools\bin\smartctl.exe");
-    if p3.is_file()
-        && let Some(valid) = check_and_accept(p3, &mut checked_paths, &mut tried) {
-            set_cached_smartctl_path(Some(valid.clone()));
-            return Some(valid);
-        }
+    // 3. %ProgramFiles%\smartmontools\bin\smartctl.exe
+    if let Ok(pf) = std::env::var("ProgramFiles") {
+        let p3 = PathBuf::from(pf).join("smartmontools").join("bin").join("smartctl.exe");
+        if p3.is_file()
+            && let Some(valid) = check_and_accept(p3, &mut checked_paths, &mut tried) {
+                set_cached_smartctl_path(Some(valid.clone()));
+                return Some(valid);
+            }
+    }
 
-    // 4. C:\Program Files (x86)\smartmontools\bin\smartctl.exe
-    let p4 = PathBuf::from(r"C:\Program Files (x86)\smartmontools\bin\smartctl.exe");
-    if p4.is_file()
-        && let Some(valid) = check_and_accept(p4, &mut checked_paths, &mut tried) {
-            set_cached_smartctl_path(Some(valid.clone()));
-            return Some(valid);
-        }
+    // 4. %ProgramFiles(x86)%\smartmontools\bin\smartctl.exe
+    if let Ok(pfx86) = std::env::var("ProgramFiles(x86)") {
+        let p4 = PathBuf::from(pfx86).join("smartmontools").join("bin").join("smartctl.exe");
+        if p4.is_file()
+            && let Some(valid) = check_and_accept(p4, &mut checked_paths, &mut tried) {
+                set_cached_smartctl_path(Some(valid.clone()));
+                return Some(valid);
+            }
+    }
 
     // 5. Windows Registry search
     for reg_path in find_in_registry() {
@@ -885,7 +889,7 @@ pub fn discover_and_query_all_drives(
         Some(p) => p,
         None => {
             let err = SmartError::SmartctlNotFound(
-                "smartctl was not found in settings, PATH, C:\\Program Files\\smartmontools\\bin, C:\\Program Files (x86)\\smartmontools\\bin, or Windows Registry".to_string(),
+                "smartctl was not found in settings, PATH, %ProgramFiles%\\smartmontools\\bin, %ProgramFiles(x86)%\\smartmontools\\bin, or Windows Registry".to_string(),
             );
             crate::logger::log_detection_failure("None", "all", "", "", &err.to_string());
             return Err(err);
@@ -931,7 +935,7 @@ pub fn run_smartctl_with_config(
         Some(p) => p,
         None => {
             let err = SmartError::SmartctlNotFound(
-                "smartctl was not found in settings, PATH, C:\\Program Files\\smartmontools\\bin, C:\\Program Files (x86)\\smartmontools\\bin, or Windows Registry".to_string(),
+                "smartctl was not found in settings, PATH, %ProgramFiles%\\smartmontools\\bin, %ProgramFiles(x86)%\\smartmontools\\bin, or Windows Registry".to_string(),
             );
             crate::logger::log_detection_failure("None", device.unwrap_or("auto"), "", "", &err.to_string());
             return Err(err);
@@ -1229,12 +1233,19 @@ mod tests {
     #[test]
     fn test_resolve_smartctl_order() {
         clear_cached_smartctl_path();
-        let p = resolve_smartctl(Some("C:\\non_existent_folder\\smartctl.exe"));
-        if Path::new(r"C:\Program Files\smartmontools\bin\smartctl.exe").is_file() {
-            assert_eq!(
-                p,
-                Some(PathBuf::from(r"C:\Program Files\smartmontools\bin\smartctl.exe"))
-            );
+        let non_existent = std::env::temp_dir()
+            .join("non_existent_folder_xyz")
+            .join("smartctl.exe");
+        let non_existent_str = non_existent.to_string_lossy();
+        let p = resolve_smartctl(Some(&non_existent_str));
+
+        let default_smartctl = std::env::var("ProgramFiles")
+            .ok()
+            .map(|pf| PathBuf::from(pf).join("smartmontools").join("bin").join("smartctl.exe"));
+        if let Some(ref expected_path) = default_smartctl
+            && expected_path.is_file()
+        {
+            assert_eq!(p, Some(expected_path.clone()));
         }
     }
 
@@ -1247,7 +1258,12 @@ mod tests {
 
     #[test]
     fn test_live_detection_and_fallback() {
-        if Path::new(r"C:\Program Files\smartmontools\bin\smartctl.exe").is_file() {
+        let default_smartctl = std::env::var("ProgramFiles")
+            .ok()
+            .map(|pf| PathBuf::from(pf).join("smartmontools").join("bin").join("smartctl.exe"));
+        if let Some(ref path) = default_smartctl
+            && path.is_file()
+        {
             let res = run_smartctl_with_config(None, None);
             crate::logger::log(&format!("Live smartctl test result: {res:?}"));
             assert!(!matches!(res, Err(SmartError::SmartctlNotFound(_))));

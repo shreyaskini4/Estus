@@ -139,6 +139,7 @@ pub struct SharedState {
     pub active_device: Option<String>,
     pub rescan_requested: bool,
     pub is_logon_startup: bool,
+    pub initialization_error: Option<String>,
 }
 
 impl SharedState {
@@ -166,6 +167,7 @@ impl SharedState {
             active_device: None,
             rescan_requested: false,
             is_logon_startup: false,
+            initialization_error: None,
         }
     }
 
@@ -372,9 +374,50 @@ pub fn handle_tray_events(
     show_requested
 }
 
+/// Ensures that the platform-specific data and configuration directories exist.
+pub fn ensure_app_directories() -> Result<(PathBuf, PathBuf)> {
+    let proj_dirs = directories::ProjectDirs::from("com", "estus", "Estus")
+        .ok_or_else(|| anyhow::anyhow!("Failed to determine project directories"))?;
+    let data_dir = proj_dirs.data_local_dir().to_path_buf();
+    let config_dir = proj_dirs.config_dir().to_path_buf();
+
+    std::fs::create_dir_all(&data_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create data directory ({}): {e}", data_dir.display()))?;
+    std::fs::create_dir_all(&config_dir)
+        .map_err(|e| anyhow::anyhow!("Failed to create config directory ({}): {e}", config_dir.display()))?;
+
+    Ok((data_dir, config_dir))
+}
+
+/// Initializes app environment directories on startup.
+/// If directory creation fails, logs an error to `estus.log` and stores an initialization error in `AppState`.
+pub fn init_app_environment(state: &AppState) {
+    if let Err(e) = ensure_app_directories() {
+        let err_msg = format!("Failed to create application directories: {e}");
+        crate::logger::log_error(&err_msg);
+        if let Ok(mut s) = state.lock() {
+            s.initialization_error = Some(err_msg);
+            s.data_changed = true;
+        }
+    }
+}
+
 /// Performs startup initialization: prunes old records and pre-loads recent historical metrics from DB.
 pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
-    let conn = crate::db::init_db()?;
+    let conn = match crate::db::init_db() {
+        Ok(c) => c,
+        Err(e) => {
+            let err_msg = format!("Failed to initialize database: {e}");
+            crate::logger::log_error(&err_msg);
+            if let Ok(mut s) = state.lock()
+                && s.initialization_error.is_none()
+            {
+                s.initialization_error = Some(err_msg);
+                s.data_changed = true;
+            }
+            return Err(e);
+        }
+    };
 
     if let Err(e) = crate::db::prune_old_records(&conn, 90) {
         crate::logger::log_warn(&format!("Warning: Failed to prune old database records: {e}"));
@@ -451,7 +494,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
         Some(p) => p,
         None => {
             let err = SmartError::SmartctlNotFound(
-                "smartctl was not found in settings, PATH, C:\\Program Files\\smartmontools\\bin, C:\\Program Files (x86)\\smartmontools\\bin, or Windows Registry".to_string(),
+                "smartctl was not found in settings, PATH, %ProgramFiles%\\smartmontools\\bin, %ProgramFiles(x86)%\\smartmontools\\bin, or Windows Registry".to_string(),
             );
             if let Ok(mut s) = state.lock() {
                 s.smart_error = Some(err);
@@ -747,11 +790,16 @@ mod tests {
                 enabled: true,
             },
         );
+        let test_smartctl_path = std::env::temp_dir()
+            .join("bin")
+            .join("smartctl.exe")
+            .to_string_lossy()
+            .to_string();
         let s = Settings {
             alert_threshold_gb: 250.0,
             start_with_windows: true,
             last_notified_date: NaiveDate::from_ymd_opt(2026, 11, 16),
-            custom_smartctl_path: Some(r"C:\bin\smartctl.exe".to_string()),
+            custom_smartctl_path: Some(test_smartctl_path),
             drives,
             verbose_logging: true,
         };
@@ -788,6 +836,7 @@ mod tests {
         assert_eq!(state.active_device, None);
         assert!(!state.rescan_requested);
         assert!(!state.is_logon_startup);
+        assert_eq!(state.initialization_error, None);
     }
 
     #[test]
@@ -811,7 +860,9 @@ mod tests {
 
     #[test]
     fn test_settings_load_nonexistent_file() {
-        let path = PathBuf::from("C:\\definitely_nonexistent_directory_xyz\\settings.json");
+        let path = std::env::temp_dir()
+            .join("definitely_nonexistent_directory_xyz")
+            .join("settings.json");
         let loaded = Settings::load_from_path(&path);
         assert_eq!(loaded, Settings::default());
     }
@@ -864,6 +915,17 @@ mod tests {
         assert_eq!(LOGON_INITIAL_DELAY_SECS, 20);
         assert_eq!(LOGON_RETRY_INTERVAL_SECS, 5);
         assert_eq!(LOGON_MAX_RETRIES, 3);
+    }
+
+    #[test]
+    fn test_ensure_app_directories_and_init_environment() {
+        let (data_dir, config_dir) = ensure_app_directories().expect("ensure_app_directories failed");
+        assert!(data_dir.exists());
+        assert!(config_dir.exists());
+
+        let state = new_app_state(Settings::default());
+        init_app_environment(&state);
+        assert_eq!(state.lock().unwrap().initialization_error, None);
     }
 
     #[test]

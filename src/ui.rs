@@ -282,6 +282,7 @@ impl eframe::App for SsdWatchApp {
             active_dev,
             last_raw_err,
             last_raw_output,
+            initialization_error,
         ) = {
             if let Ok(s) = self.state.lock() {
                 (
@@ -300,6 +301,7 @@ impl eframe::App for SsdWatchApp {
                     s.active_device.clone(),
                     s.last_raw_error.clone(),
                     s.last_raw_output.clone(),
+                    s.initialization_error.clone(),
                 )
             } else {
                 return;
@@ -335,6 +337,12 @@ impl eframe::App for SsdWatchApp {
                 );
 
                 ui.add_space(8.0);
+
+                // Top Banner / Initialization Error Card
+                if let Some(ref init_err) = initialization_error {
+                    render_initialization_error_banner(ui, init_err);
+                    ui.add_space(6.0);
+                }
 
                 // Top Banner / Error Card
                 if let Some(ref err) = smart_error {
@@ -635,6 +643,30 @@ fn render_diagnostics_panel(
                     });
             });
     });
+}
+
+/// Renders guidance banner if application startup or directory creation encountered an error.
+fn render_initialization_error_banner(ui: &mut egui::Ui, err: &str) {
+    egui::Frame::group(ui.style())
+        .fill(Color32::from_rgb(45, 20, 20))
+        .stroke(Stroke::new(1.0, Color32::from_rgb(220, 53, 69)))
+        .corner_radius(6.0)
+        .inner_margin(12.0)
+        .show(ui, |ui| {
+            ui.horizontal(|ui| {
+                ui.label(RichText::new("⚠️").size(24.0));
+                ui.vertical(|ui| {
+                    ui.strong(
+                        RichText::new("Application Initialization Error")
+                            .color(Color32::from_rgb(255, 100, 100)),
+                    );
+                    ui.label(
+                        "Estus encountered an error creating required application data or log directories.",
+                    );
+                    ui.label(RichText::new(err).small().color(Color32::LIGHT_GRAY));
+                });
+            });
+        });
 }
 
 /// Renders guidance banner if SMART collection encountered an error.
@@ -1450,11 +1482,13 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
 
                             if let Err(e) = s.settings.save() {
                                 result = Err(format!(
-                                    "Failed to save settings: {e}. See %LOCALAPPDATA%\\estus\\Estus\\data\\estus.log for details"
+                                    "Failed to save settings: {e}. See {} for details",
+                                    crate::logger::get_log_file_path().display()
                                 ));
                             } else if let Err(e) = s.settings.apply_autostart() {
                                 result = Err(format!(
-                                    "Saved settings, but failed to configure Windows autostart: {e}. See %LOCALAPPDATA%\\estus\\Estus\\data\\estus.log for details"
+                                    "Saved settings, but failed to configure Windows autostart: {e}. See {} for details",
+                                    crate::logger::get_log_file_path().display()
                                 ));
                             } else {
                                 s.data_changed = true;

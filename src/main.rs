@@ -33,25 +33,29 @@ fn main() -> eframe::Result<()> {
         start_minimized
     ));
 
-    // Automatically sync autostart task path if the binary has been relocated
-    let _ = crate::autostart::sync_task_if_path_changed();
-
     // 1. Load settings and create shared application state
     let settings = app_core::Settings::load();
-    let state = app_core::new_app_state(settings);
+    let state = app_core::new_app_state(settings.clone());
+
+    // 2. Ensure application data and log directories exist on startup
+    app_core::init_app_environment(&state);
+
+    // 3. Automatically sync autostart task path if "Start with Windows" is enabled in settings
+    let _ = crate::autostart::sync_task_with_settings(settings.start_with_windows);
+
     if start_minimized
         && let Ok(mut s) = state.lock() {
             s.show_window = false;
             s.is_logon_startup = true;
         }
 
-    // 2. Start background worker threads (SMART poller, procs poller, database pruning)
+    // 4. Start background worker threads (SMART poller, procs poller, database pruning)
     let _threads = app_core::start_background_threads(Arc::clone(&state), start_minimized);
 
-    // 3. Initialize system tray
+    // 5. Initialize system tray
     let tray_bundle = app_core::init_tray().ok();
 
-    // 4. Configure native window options
+    // 6. Configure native window options
     let native_options = eframe::NativeOptions {
         viewport: egui::ViewportBuilder::default()
             .with_title("Estus")
