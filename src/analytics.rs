@@ -1,4 +1,4 @@
-use chrono::NaiveDate;
+use crate::db::DailyWrites;
 
 /// Standard decimal gigabyte: 1,000,000,000 bytes (storage industry standard matching NVMe SMART specifications).
 pub const BYTES_PER_GB: f64 = 1_000_000_000.0;
@@ -6,19 +6,19 @@ pub const BYTES_PER_GB: f64 = 1_000_000_000.0;
 /// Calculate average GB/day over the last 7 days (or up to 7 days if fewer days of data exist).
 ///
 /// Returns 0.0 if `daily_writes` is empty.
-pub fn average_daily_writes_gb(daily_writes: &[(NaiveDate, u64)]) -> f64 {
+pub fn average_daily_writes_gb(daily_writes: &[DailyWrites]) -> f64 {
     if daily_writes.is_empty() {
         return 0.0;
     }
 
     let mut sorted = daily_writes.to_vec();
-    sorted.sort_by_key(|(date, _)| *date);
+    sorted.sort_by_key(|dw| dw.date);
 
     let count = sorted.len().min(7);
     let start_idx = sorted.len() - count;
     let recent = &sorted[start_idx..];
 
-    let total_bytes: f64 = recent.iter().map(|(_, bytes)| *bytes as f64).sum();
+    let total_bytes: f64 = recent.iter().map(|dw| dw.total_bytes() as f64).sum();
     (total_bytes / count as f64) / BYTES_PER_GB
 }
 
@@ -100,11 +100,23 @@ mod tests {
         let d2 = NaiveDate::from_ymd_opt(2026, 11, 2).unwrap();
         let d3 = NaiveDate::from_ymd_opt(2026, 11, 3).unwrap();
 
-        // 10 GB, 20 GB, 30 GB -> average is 20 GB
+        // 10 GB (active), 20 GB (15 active + 5 gap), 30 GB (active) -> average is 20 GB
         let data = vec![
-            (d1, 10_000_000_000),
-            (d2, 20_000_000_000),
-            (d3, 30_000_000_000),
+            DailyWrites {
+                date: d1,
+                active_bytes: 10_000_000_000,
+                gap_bytes: 0,
+            },
+            DailyWrites {
+                date: d2,
+                active_bytes: 15_000_000_000,
+                gap_bytes: 5_000_000_000,
+            },
+            DailyWrites {
+                date: d3,
+                active_bytes: 30_000_000_000,
+                gap_bytes: 0,
+            },
         ];
 
         let avg = average_daily_writes_gb(&data);
@@ -116,7 +128,11 @@ mod tests {
         let mut data = Vec::new();
         for day in 1..=7 {
             let d = NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
-            data.push((d, 5_000_000_000)); // 5 GB every day
+            data.push(DailyWrites {
+                date: d,
+                active_bytes: 5_000_000_000,
+                gap_bytes: 0,
+            }); // 5 GB every day
         }
 
         let avg = average_daily_writes_gb(&data);
@@ -129,12 +145,20 @@ mod tests {
         // Days 1..=3: 100 GB each (older days, should be ignored)
         for day in 1..=3 {
             let d = NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
-            data.push((d, 100_000_000_000));
+            data.push(DailyWrites {
+                date: d,
+                active_bytes: 100_000_000_000,
+                gap_bytes: 0,
+            });
         }
-        // Days 4..=10: 10 GB each (last 7 days)
+        // Days 4..=10: 10 GB each (last 7 days, with some gap bytes to verify total_bytes)
         for day in 4..=10 {
             let d = NaiveDate::from_ymd_opt(2026, 11, day).unwrap();
-            data.push((d, 10_000_000_000));
+            data.push(DailyWrites {
+                date: d,
+                active_bytes: 8_000_000_000,
+                gap_bytes: 2_000_000_000,
+            });
         }
 
         let avg = average_daily_writes_gb(&data);

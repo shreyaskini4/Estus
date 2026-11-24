@@ -199,6 +199,13 @@ mod tests {
     }
 
     #[test]
+    fn test_default_constants() {
+        assert!(DEFAULT_MUTEX_NAME.starts_with("Local\\"));
+        assert!(DEFAULT_EVENT_NAME.starts_with("Local\\"));
+        assert_ne!(DEFAULT_MUTEX_NAME, DEFAULT_EVENT_NAME);
+    }
+
+    #[test]
     fn test_single_instance_acquisition_and_conflict() {
         let unique_mutex = format!("Local\\Estus_Test_Mutex_{}", std::process::id());
         let unique_event = format!("Local\\Estus_Test_Event_{}", std::process::id());

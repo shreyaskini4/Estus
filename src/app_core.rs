@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -121,13 +122,16 @@ pub struct SharedState {
     pub detected_drives: Vec<DriveInfo>,
     pub selected_drive_id: Option<String>,
     pub per_drive_snapshots: std::collections::HashMap<String, SmartSnapshot>,
-    pub per_drive_daily_writes: std::collections::HashMap<String, Vec<(NaiveDate, u64)>>,
+    pub per_drive_daily_writes: std::collections::HashMap<String, Vec<crate::db::DailyWrites>>,
+    pub per_drive_intervals: std::collections::HashMap<String, Vec<crate::db::SnapshotInterval>>,
     pub latest_smart: Option<SmartSnapshot>,
     pub smart_error: Option<SmartError>,
-    pub daily_writes: Vec<(NaiveDate, u64)>,
+    pub daily_writes: Vec<crate::db::DailyWrites>,
+    pub intervals_24h: Vec<crate::db::SnapshotInterval>,
     pub top_processes_today: Vec<(String, u64)>,
     pub top_processes_7d: Vec<(String, u64)>,
     pub top_processes_30d: Vec<(String, u64)>,
+    pub latest_ssd_delta_bytes: Option<u64>,
     pub settings: Settings,
     pub data_changed: bool,
     pub show_window: bool,
@@ -150,12 +154,15 @@ impl SharedState {
             selected_drive_id: None,
             per_drive_snapshots: std::collections::HashMap::new(),
             per_drive_daily_writes: std::collections::HashMap::new(),
+            per_drive_intervals: std::collections::HashMap::new(),
             latest_smart: None,
             smart_error: None,
             daily_writes: Vec::new(),
+            intervals_24h: Vec::new(),
             top_processes_today: Vec::new(),
             top_processes_7d: Vec::new(),
             top_processes_30d: Vec::new(),
+            latest_ssd_delta_bytes: None,
             settings,
             data_changed: false,
             show_window: true,
@@ -185,7 +192,7 @@ impl SharedState {
         }
     }
 
-    pub fn get_selected_daily_writes(&self) -> &[(NaiveDate, u64)] {
+    pub fn get_selected_daily_writes(&self) -> &[crate::db::DailyWrites] {
         if let Some(ref id) = self.selected_drive_id {
             self.per_drive_daily_writes
                 .get(id)
@@ -193,6 +200,17 @@ impl SharedState {
                 .unwrap_or(&[])
         } else {
             &self.daily_writes
+        }
+    }
+
+    pub fn get_selected_intervals_24h(&self) -> &[crate::db::SnapshotInterval] {
+        if let Some(ref id) = self.selected_drive_id {
+            self.per_drive_intervals
+                .get(id)
+                .map(|v| v.as_slice())
+                .unwrap_or(&[])
+        } else {
+            &self.intervals_24h
         }
     }
 }
@@ -341,6 +359,7 @@ pub fn handle_tray_events(
             show_requested = true;
         } else if event.id == *quit_id {
             crate::logger::log_info("Tray menu: Quit clicked. Terminating application.");
+            take_exit_snapshot(state);
             if let Ok(mut s) = state.lock() {
                 s.should_quit = true;
             }
@@ -426,6 +445,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
     let drives = crate::db::get_drives(&conn)?;
     let mut per_drive_snaps = std::collections::HashMap::new();
     let mut per_drive_writes = std::collections::HashMap::new();
+    let mut per_drive_intervals = std::collections::HashMap::new();
     let mut first_snap = None;
 
     for drive in &drives {
@@ -438,9 +458,13 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
         if let Ok(daily) = crate::db::daily_writes(&conn, Some(&drive.id), 30) {
             per_drive_writes.insert(drive.id.clone(), daily);
         }
+        if let Ok(intervals) = crate::db::get_intervals_24h(&conn, Some(&drive.id)) {
+            per_drive_intervals.insert(drive.id.clone(), intervals);
+        }
     }
 
     let daily_writes = crate::db::daily_writes(&conn, None, 30)?;
+    let intervals_24h = crate::db::get_intervals_24h(&conn, None).unwrap_or_default();
 
     let now_ts = chrono::Utc::now().timestamp();
     let today = Local::now().date_naive();
@@ -458,8 +482,10 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
         s.detected_drives = drives;
         s.per_drive_snapshots = per_drive_snaps;
         s.per_drive_daily_writes = per_drive_writes;
+        s.per_drive_intervals = per_drive_intervals;
         s.latest_smart = first_snap;
         s.daily_writes = daily_writes;
+        s.intervals_24h = intervals_24h;
         s.top_processes_today = top_today;
         s.top_processes_7d = top_7d;
         s.top_processes_30d = top_30d;
@@ -515,7 +541,9 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
             let today = chrono::Local::now().date_naive();
             let mut per_drive_snaps = std::collections::HashMap::new();
             let mut per_drive_writes = std::collections::HashMap::new();
+            let mut per_drive_intervals = std::collections::HashMap::new();
             let mut active_drives = Vec::new();
+            let mut cycle_ssd_delta: u64 = 0;
 
             for (drive_info, snapshot) in &discovered {
                 let mut info = drive_info.clone();
@@ -527,13 +555,32 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 if let Ok(ref conn) = conn_res {
                     let _ = crate::db::upsert_drive(conn, &info);
                     if info.enabled {
+                        if let Ok(Some(prev)) = crate::db::latest_snapshot(conn, &info.id) {
+                            let elapsed = snapshot.ts.saturating_sub(prev.ts);
+                            if snapshot.data_units_written >= prev.data_units_written {
+                                let delta_units = snapshot.data_units_written - prev.data_units_written;
+                                let delta_bytes = delta_units.saturating_mul(512_000);
+                                if delta_bytes > 5_000_000_000 {
+                                    let delta_gb = delta_bytes as f64 / 1_000_000_000.0;
+                                    crate::logger::log_info(&format!(
+                                        "High write volume detected in single interval for drive '{}': delta = {:.2} GB, previous raw = {}, current raw = {}, interval = {}s",
+                                        info.id, delta_gb, prev.data_units_written, snapshot.data_units_written, elapsed
+                                    ));
+                                }
+                                if elapsed <= crate::db::GAP_THRESHOLD_SECS {
+                                    cycle_ssd_delta = cycle_ssd_delta.saturating_add(delta_bytes);
+                                }
+                            }
+                        }
+
                         let _ = crate::db::insert_snapshot(conn, &info.id, snapshot);
                         let daily = crate::db::daily_writes(conn, Some(&info.id), 30).unwrap_or_default();
+                        let intervals = crate::db::get_intervals_24h(conn, Some(&info.id)).unwrap_or_default();
 
                         let today_bytes = daily
                             .iter()
-                            .find(|(d, _)| *d == today)
-                            .map(|(_, b)| *b)
+                            .find(|dw| dw.date == today)
+                            .map(|dw| dw.total_bytes())
                             .unwrap_or(0);
 
                         let drive_label = info
@@ -549,18 +596,20 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                         );
 
                         per_drive_writes.insert(info.id.clone(), daily);
+                        per_drive_intervals.insert(info.id.clone(), intervals);
                         per_drive_snaps.insert(info.id.clone(), snapshot.clone());
                     }
                 }
                 active_drives.push(info);
             }
 
-            let (all_db_drives, aggregated_daily) = if let Ok(ref conn) = conn_res {
+            let (all_db_drives, aggregated_daily, aggregated_intervals) = if let Ok(ref conn) = conn_res {
                 let d = crate::db::get_drives(conn).unwrap_or_else(|_| active_drives.clone());
                 let agg = crate::db::daily_writes(conn, None, 30).unwrap_or_default();
-                (d, agg)
+                let agg_int = crate::db::get_intervals_24h(conn, None).unwrap_or_default();
+                (d, agg, agg_int)
             } else {
-                (active_drives, Vec::new())
+                (active_drives, Vec::new(), Vec::new())
             };
 
             let first_snap = per_drive_snaps.values().next().cloned();
@@ -573,10 +622,13 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
             ));
 
             if let Ok(mut s) = state.lock() {
+                s.latest_ssd_delta_bytes = Some(cycle_ssd_delta);
                 s.detected_drives = all_db_drives;
                 s.per_drive_snapshots = per_drive_snaps;
                 s.per_drive_daily_writes = per_drive_writes;
+                s.per_drive_intervals = per_drive_intervals;
                 s.daily_writes = aggregated_daily;
+                s.intervals_24h = aggregated_intervals;
                 if s.latest_smart.is_none() || first_snap.is_some() {
                     s.latest_smart = first_snap;
                 }
@@ -605,13 +657,50 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
     }
 }
 
+/// SMART polling interval: 5 minutes (300 seconds).
+pub const SMART_POLL_INTERVAL_SECS: u64 = 300;
+
+/// Forces an immediate synchronous SMART poll and snapshot cycle, recording snapshots for all enabled drives.
+pub fn poll_smart_cycle_force(state: &AppState) -> bool {
+    crate::logger::log_info("Executing forced SMART polling cycle...");
+    poll_smart_cycle(state)
+}
+
+/// Takes a final SMART snapshot for all enabled drives before application shutdown to minimize gap times.
+pub fn take_exit_snapshot(state: &AppState) {
+    crate::logger::log_info("Taking exit SMART snapshot before shutdown...");
+    poll_smart_cycle(state);
+}
+
+/// Atomic flags ensuring background pollers run as singletons.
+pub static SMART_POLLER_RUNNING: AtomicBool = AtomicBool::new(false);
+pub static PROCS_POLLER_RUNNING: AtomicBool = AtomicBool::new(false);
+
 /// Spawns the SMART Poller thread. Runs immediately (or delayed at logon startup),
-/// retries on early failure, and then repeats every 10 minutes.
+/// retries on early failure, and then repeats every 5 minutes.
 /// Listens for manual rescan trigger via `rescan_requested`.
 pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::thread::JoinHandle<()> {
+    if SMART_POLLER_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        crate::logger::log_warn(
+            "spawn_smart_poller called while SMART poller is already running; returning no-op handle",
+        );
+        return std::thread::spawn(|| {});
+    }
+
     std::thread::Builder::new()
         .name("estus-smart-poller".to_string())
         .spawn(move || {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    SMART_POLLER_RUNNING.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard;
+
             if is_logon_startup {
                 crate::logger::log_info(&format!(
                     "Startup was minimized (logon startup); delaying initial SMART poll by {} seconds for disk drivers to initialize",
@@ -664,8 +753,8 @@ pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::threa
             }
 
             loop {
-                // Sleep for up to 10 minutes (600s), checking rescan_requested and should_quit every 500ms
-                for _ in 0..1200 {
+                // Sleep for up to 5 minutes (300s), checking rescan_requested and should_quit every 500ms
+                for _ in 0..(SMART_POLL_INTERVAL_SECS * 2) {
                     if let Ok(mut s) = state.lock() {
                         if s.should_quit {
                             return;
@@ -691,10 +780,30 @@ pub fn spawn_smart_poller(state: AppState, is_logon_startup: bool) -> std::threa
 
 /// Spawns the Process Poller thread. Runs every 30 seconds.
 pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
+    if PROCS_POLLER_RUNNING
+        .compare_exchange(false, true, Ordering::SeqCst, Ordering::SeqCst)
+        .is_err()
+    {
+        crate::logger::log_warn(
+            "spawn_procs_poller called while procs poller is already running; returning no-op handle",
+        );
+        return std::thread::spawn(|| {});
+    }
+
     std::thread::Builder::new()
         .name("estus-procs-poller".to_string())
         .spawn(move || {
+            struct Guard;
+            impl Drop for Guard {
+                fn drop(&mut self) {
+                    PROCS_POLLER_RUNNING.store(false, Ordering::SeqCst);
+                }
+            }
+            let _guard = Guard;
+
             let mut collector = crate::procs::ProcCollector::new();
+            let mut accumulated_deltas: std::collections::HashMap<String, u64> =
+                std::collections::HashMap::new();
 
             loop {
                 for _ in 0..30 {
@@ -710,43 +819,57 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
                         return;
                     }
 
-                let deltas = collector.poll_deltas();
-                let now_ts = chrono::Utc::now().timestamp();
+                let raw_deltas = collector.poll_deltas();
+                for (name, bytes) in raw_deltas {
+                    *accumulated_deltas.entry(name).or_insert(0) += bytes;
+                }
 
-                if let Ok(conn) = crate::db::init_db() {
-                    if !deltas.is_empty() {
-                        let _ = crate::db::insert_process_deltas(&conn, now_ts, &deltas);
-                    }
+                let ssd_delta_opt = if let Ok(mut s) = state.lock() {
+                    s.latest_ssd_delta_bytes.take()
+                } else {
+                    None
+                };
 
-                    let daily = crate::db::daily_writes(&conn, None, 30).unwrap_or_default();
-                    let today = Local::now().date_naive();
-                    let today_start_ts = today
-                        .and_hms_opt(0, 0, 0)
-                        .and_then(|t| t.and_local_timezone(Local).single())
-                        .map(|dt| dt.timestamp())
-                        .unwrap_or(now_ts - 86_400);
+                if let Some(ssd_delta) = ssd_delta_opt {
+                    let acc_vec: Vec<(String, u64)> = accumulated_deltas.drain().collect();
+                    let deltas = crate::procs::normalize_process_deltas(&acc_vec, ssd_delta);
+                    let now_ts = chrono::Utc::now().timestamp();
 
-                    let top_today =
-                        crate::db::top_processes(&conn, today_start_ts, 10).unwrap_or_default();
-                    let top_7d =
-                        crate::db::top_processes(&conn, now_ts - 7 * 86_400, 10).unwrap_or_default();
-                    let top_30d =
-                        crate::db::top_processes(&conn, now_ts - 30 * 86_400, 10).unwrap_or_default();
+                    if let Ok(conn) = crate::db::init_db() {
+                        if !deltas.is_empty() {
+                            let _ = crate::db::insert_process_deltas(&conn, now_ts, &deltas);
+                        }
 
-                    let today_bytes = daily
-                        .iter()
-                        .find(|(d, _)| *d == today)
-                        .map(|(_, b)| *b)
-                        .unwrap_or(0);
+                        let daily = crate::db::daily_writes(&conn, None, 30).unwrap_or_default();
+                        let today = Local::now().date_naive();
+                        let today_start_ts = today
+                            .and_hms_opt(0, 0, 0)
+                            .and_then(|t| t.and_local_timezone(Local).single())
+                            .map(|dt| dt.timestamp())
+                            .unwrap_or(now_ts - 86_400);
 
-                    let _ = check_and_send_alert(&state, today_bytes, today);
+                        let top_today =
+                            crate::db::top_processes(&conn, today_start_ts, 10).unwrap_or_default();
+                        let top_7d =
+                            crate::db::top_processes(&conn, now_ts - 7 * 86_400, 10).unwrap_or_default();
+                        let top_30d =
+                            crate::db::top_processes(&conn, now_ts - 30 * 86_400, 10).unwrap_or_default();
 
-                    if let Ok(mut s) = state.lock() {
-                        s.daily_writes = daily;
-                        s.top_processes_today = top_today;
-                        s.top_processes_7d = top_7d;
-                        s.top_processes_30d = top_30d;
-                        s.data_changed = true;
+                        let today_bytes = daily
+                            .iter()
+                            .find(|dw| dw.date == today)
+                            .map(|dw| dw.total_bytes())
+                            .unwrap_or(0);
+
+                        let _ = check_and_send_alert(&state, today_bytes, today);
+
+                        if let Ok(mut s) = state.lock() {
+                            s.daily_writes = daily;
+                            s.top_processes_today = top_today;
+                            s.top_processes_7d = top_7d;
+                            s.top_processes_30d = top_30d;
+                            s.data_changed = true;
+                        }
                     }
                 }
             }
@@ -755,10 +878,24 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
 }
 
 /// Spawns both poller threads and performs startup pruning / state initialization.
+/// If pollers are already running, logs a warning and returns no-op handles.
 pub fn start_background_threads(
     state: AppState,
     is_logon_startup: bool,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    if SMART_POLLER_RUNNING.load(Ordering::SeqCst) && PROCS_POLLER_RUNNING.load(Ordering::SeqCst) {
+        crate::logger::log_warn(
+            "start_background_threads called while background pollers are already running; skipping initialization",
+        );
+        return (
+            spawn_smart_poller(Arc::clone(&state), is_logon_startup),
+            spawn_procs_poller(Arc::clone(&state)),
+        );
+    }
+
+    if !is_logon_startup {
+        poll_smart_cycle_force(&state);
+    }
     let _ = initialize_database_and_state(&state);
     let smart_handle = spawn_smart_poller(Arc::clone(&state), is_logon_startup);
     let procs_handle = spawn_procs_poller(Arc::clone(&state));
@@ -819,12 +956,15 @@ mod tests {
         assert!(state.detected_drives.is_empty());
         assert_eq!(state.selected_drive_id, None);
         assert!(state.per_drive_snapshots.is_empty());
+        assert!(state.per_drive_intervals.is_empty());
         assert!(state.latest_smart.is_none());
         assert!(state.smart_error.is_none());
         assert!(state.daily_writes.is_empty());
+        assert!(state.intervals_24h.is_empty());
         assert!(state.top_processes_today.is_empty());
         assert!(state.top_processes_7d.is_empty());
         assert!(state.top_processes_30d.is_empty());
+        assert_eq!(state.latest_ssd_delta_bytes, None);
         assert_eq!(state.settings, settings);
         assert!(!state.data_changed);
         assert!(state.show_window);
@@ -967,5 +1107,46 @@ mod tests {
         assert!(!crate::logger::is_verbose_logging());
 
         let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn test_poller_double_spawn_guard() {
+        let settings = Settings::default();
+        let state = new_app_state(settings);
+        state.lock().unwrap().should_quit = true;
+
+        // Manually simulate SMART_POLLER_RUNNING flag
+        SMART_POLLER_RUNNING.store(true, Ordering::SeqCst);
+        let handle1 = spawn_smart_poller(Arc::clone(&state), false);
+        // handle1 should be a no-op handle that finishes immediately
+        handle1.join().unwrap();
+        // Reset flag
+        SMART_POLLER_RUNNING.store(false, Ordering::SeqCst);
+
+        // Manually simulate PROCS_POLLER_RUNNING flag
+        PROCS_POLLER_RUNNING.store(true, Ordering::SeqCst);
+        let handle2 = spawn_procs_poller(Arc::clone(&state));
+        // handle2 should be a no-op handle that finishes immediately
+        handle2.join().unwrap();
+        // Reset flag
+        PROCS_POLLER_RUNNING.store(false, Ordering::SeqCst);
+    }
+
+    #[test]
+    fn test_start_background_threads_double_call_guard() {
+        let settings = Settings::default();
+        let state = new_app_state(settings);
+        state.lock().unwrap().should_quit = true;
+
+        // Set both flags to true
+        SMART_POLLER_RUNNING.store(true, Ordering::SeqCst);
+        PROCS_POLLER_RUNNING.store(true, Ordering::SeqCst);
+
+        let (h1, h2) = start_background_threads(Arc::clone(&state), false);
+        h1.join().unwrap();
+        h2.join().unwrap();
+
+        SMART_POLLER_RUNNING.store(false, Ordering::SeqCst);
+        PROCS_POLLER_RUNNING.store(false, Ordering::SeqCst);
     }
 }

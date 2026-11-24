@@ -4,9 +4,14 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 use sysinfo::{Pid, ProcessRefreshKind, ProcessesToUpdate, System};
 
+/// Unique identifier for a process instance: `(Pid, start_time)`.
+/// When a PID is reused by the OS, its new `start_time` will differ,
+/// ensuring it is treated as a distinct process.
+pub type ProcessKey = (Pid, u64);
+
 /// Periodically collects per-process disk write metrics using minimal sysinfo overhead.
 pub struct ProcCollector {
-    pub prev_readings: HashMap<Pid, u64>,
+    pub prev_readings: HashMap<ProcessKey, u64>,
     pub sys: System,
 }
 
@@ -20,7 +25,7 @@ impl ProcCollector {
 
         let mut prev_readings = HashMap::with_capacity(sys.processes().len());
         for (pid, proc) in sys.processes() {
-            prev_readings.insert(*pid, proc.disk_usage().total_written_bytes);
+            prev_readings.insert((*pid, proc.start_time()), proc.disk_usage().total_written_bytes);
         }
 
         Self {
@@ -42,13 +47,13 @@ impl ProcCollector {
         self.sys
             .refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
 
-        let current_readings: Vec<(Pid, String, u64)> = self
+        let current_readings: Vec<(ProcessKey, String, u64)> = self
             .sys
             .processes()
             .iter()
             .map(|(&pid, proc)| {
                 (
-                    pid,
+                    (pid, proc.start_time()),
                     proc.name().to_string_lossy().to_string(),
                     proc.disk_usage().total_written_bytes,
                 )
@@ -56,15 +61,25 @@ impl ProcCollector {
             .collect();
 
         // Prune exited processes from prev_readings to prevent memory unbounded growth
-        let active_pids: std::collections::HashSet<Pid> =
-            self.sys.processes().keys().copied().collect();
-        self.prev_readings.retain(|pid, _| active_pids.contains(pid));
+        let active_keys: std::collections::HashSet<ProcessKey> = self
+            .sys
+            .processes()
+            .iter()
+            .map(|(&pid, proc)| (pid, proc.start_time()))
+            .collect();
+        self.prev_readings.retain(|key, _| active_keys.contains(key));
 
         calculate_deltas(&mut self.prev_readings, &current_readings)
     }
 
+    /// Polls raw process write deltas and normalizes them against the interval's SSD delta bytes.
+    pub fn poll_normalized_deltas(&mut self, ssd_delta_bytes: u64) -> Vec<(String, u64)> {
+        let raw = self.poll_deltas();
+        normalize_process_deltas(&raw, ssd_delta_bytes)
+    }
+
     /// Returns a reference to the previous readings map.
-    pub fn prev_readings(&self) -> &HashMap<Pid, u64> {
+    pub fn prev_readings(&self) -> &HashMap<ProcessKey, u64> {
         &self.prev_readings
     }
 }
@@ -79,27 +94,28 @@ impl Default for ProcCollector {
 /// them by process name, and filters out zero or negative deltas.
 ///
 /// Rules:
-/// - `delta = current_written - prev_written`
-/// - If a PID appears for the first time, its baseline is recorded into `prev_readings`
-///   and no delta is emitted (treated as 0 delta / skipped).
-/// - If `current_written < prev_written` (PID reuse or counter wrap), the delta is ignored
-///   and `prev_readings` is reset to the current reading.
+/// - Processes are identified by `(Pid, start_time)` (where `start_time` is `proc.start_time()` from sysinfo).
+/// - If a `(Pid, start_time)` appears for the first time, its baseline is recorded into `prev_readings`
+///   and no delta is emitted (treated as 0 delta / skipped). Only subsequent increases count.
+/// - If `current_written < prev_written` (counter wrap or negative delta), the delta is ignored / skipped
+///   and `prev_readings` is updated with the current reading.
 /// - Deltas are aggregated by process name so multiple threads / instances sum together.
 /// - Processes with `delta == 0` are omitted to save storage and keep overhead minimal.
 pub fn calculate_deltas(
-    prev_readings: &mut HashMap<Pid, u64>,
-    current_readings: &[(Pid, String, u64)],
+    prev_readings: &mut HashMap<ProcessKey, u64>,
+    current_readings: &[(ProcessKey, String, u64)],
 ) -> Vec<(String, u64)> {
     let mut aggregated: HashMap<String, u64> = HashMap::new();
 
-    for (pid, name, current_written) in current_readings {
-        if let Some(&prev_written) = prev_readings.get(pid)
-            && *current_written > prev_written {
-                let delta = *current_written - prev_written;
-                *aggregated.entry(name.clone()).or_insert(0) += delta;
-            }
-        // Update baseline for next iteration (handles normal increase, reset on PID reuse, or new PID)
-        prev_readings.insert(*pid, *current_written);
+    for (key, name, current_written) in current_readings {
+        if let Some(&prev_written) = prev_readings.get(key)
+            && *current_written > prev_written
+        {
+            let delta = *current_written - prev_written;
+            *aggregated.entry(name.clone()).or_insert(0) += delta;
+        }
+        // Baseline on first sighting, or update baseline for next iteration
+        prev_readings.insert(*key, *current_written);
     }
 
     let mut result: Vec<(String, u64)> = aggregated
@@ -115,36 +131,83 @@ pub fn calculate_deltas(
 /// Convenience function that refreshes `sys`, reads disk usage, and updates `prev_readings`.
 pub fn collect_process_deltas(
     sys: &mut System,
-    prev_readings: &mut HashMap<Pid, u64>,
+    prev_readings: &mut HashMap<ProcessKey, u64>,
 ) -> Vec<(String, u64)> {
     let refresh_kind = ProcessRefreshKind::nothing().with_disk_usage();
     sys.refresh_processes_specifics(ProcessesToUpdate::All, true, refresh_kind);
 
-    let current_readings: Vec<(Pid, String, u64)> = sys
+    let current_readings: Vec<(ProcessKey, String, u64)> = sys
         .processes()
         .iter()
         .map(|(&pid, proc)| {
             (
-                pid,
+                (pid, proc.start_time()),
                 proc.name().to_string_lossy().to_string(),
                 proc.disk_usage().total_written_bytes,
             )
         })
         .collect();
 
-    let active_pids: std::collections::HashSet<Pid> = sys.processes().keys().copied().collect();
-    prev_readings.retain(|pid, _| active_pids.contains(pid));
+    let active_keys: std::collections::HashSet<ProcessKey> = sys
+        .processes()
+        .iter()
+        .map(|(&pid, proc)| (pid, proc.start_time()))
+        .collect();
+    prev_readings.retain(|key, _| active_keys.contains(key));
 
     calculate_deltas(prev_readings, &current_readings)
 }
 
-/// Performs a single collection step: polls process write deltas and, if a database
-/// connection is supplied, batch-inserts them into the SQLite database.
+/// Normalizes process write deltas against real SSD written bytes for the interval.
+///
+/// Because `sysinfo` process I/O counters include network, pipe, and IPC I/O,
+/// they must not be presented as exact raw disk GB.
+///
+/// For each interval:
+/// - `sum_deltas = sum of all process_deltas in interval`
+/// - `share_ratio = process_delta as f64 / sum_deltas as f64`
+/// - `estimated_process_bytes = (share_ratio * ssd_delta_bytes as f64).round() as u64`
+///
+/// If `ssd_delta_bytes == 0` (or `process_deltas` is empty), returns an empty `Vec`
+/// (recording no shares when the SSD did not write anything).
+pub fn normalize_process_deltas(
+    process_deltas: &[(String, u64)],
+    ssd_delta_bytes: u64,
+) -> Vec<(String, u64)> {
+    if ssd_delta_bytes == 0 || process_deltas.is_empty() {
+        return Vec::new();
+    }
+
+    let sum_deltas: u64 = process_deltas.iter().map(|(_, bytes)| *bytes).sum();
+    if sum_deltas == 0 {
+        return Vec::new();
+    }
+
+    let mut result: Vec<(String, u64)> = process_deltas
+        .iter()
+        .filter_map(|(name, delta)| {
+            let share_ratio = *delta as f64 / sum_deltas as f64;
+            let estimated_process_bytes = (share_ratio * ssd_delta_bytes as f64).round() as u64;
+            if estimated_process_bytes > 0 {
+                Some((name.clone(), estimated_process_bytes))
+            } else {
+                None
+            }
+        })
+        .collect();
+
+    result.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    result
+}
+
+/// Performs a single collection step: polls process write deltas, normalizes them against
+/// `ssd_delta_bytes`, and, if a database connection is supplied, batch-inserts them into SQLite.
 pub fn step_proc_collector(
     collector: &mut ProcCollector,
     conn: Option<&rusqlite::Connection>,
+    ssd_delta_bytes: u64,
 ) -> anyhow::Result<Vec<(String, u64)>> {
-    let deltas = collector.poll_deltas();
+    let deltas = collector.poll_normalized_deltas(ssd_delta_bytes);
     if let Some(c) = conn
         && !deltas.is_empty() {
             let ts = chrono::Utc::now().timestamp();
@@ -208,17 +271,31 @@ mod tests {
     use super::*;
 
     #[test]
+    fn test_first_sighting_of_process_baseline_adds_zero() {
+        let mut prev = HashMap::new();
+        let key = (Pid::from(100), 10_000u64);
+
+        // First sighting of process with 50,000 bytes written
+        let current = vec![(key, "app.exe".to_string(), 50_000)];
+        let deltas = calculate_deltas(&mut prev, &current);
+
+        // Baseline adds 0 (empty deltas returned)
+        assert!(deltas.is_empty(), "First sighting of process baseline must add zero");
+        assert_eq!(prev.get(&key), Some(&50_000));
+    }
+
+    #[test]
     fn test_normal_delta_increase() {
         let mut prev = HashMap::new();
-        let pid1 = Pid::from(101);
-        let pid2 = Pid::from(102);
+        let key1 = (Pid::from(101), 10_000u64);
+        let key2 = (Pid::from(102), 12_000u64);
 
-        prev.insert(pid1, 1_000);
-        prev.insert(pid2, 2_000);
+        prev.insert(key1, 1_000);
+        prev.insert(key2, 2_000);
 
         let current = vec![
-            (pid1, "editor.exe".to_string(), 1_500),
-            (pid2, "browser.exe".to_string(), 2_800),
+            (key1, "editor.exe".to_string(), 1_500),
+            (key2, "browser.exe".to_string(), 2_800),
         ];
 
         let deltas = calculate_deltas(&mut prev, &current);
@@ -229,42 +306,91 @@ mod tests {
         assert_eq!(deltas[1], ("editor.exe".to_string(), 500));
 
         // Baseline in prev_readings should be updated
-        assert_eq!(prev.get(&pid1), Some(&1_500));
-        assert_eq!(prev.get(&pid2), Some(&2_800));
+        assert_eq!(prev.get(&key1), Some(&1_500));
+        assert_eq!(prev.get(&key2), Some(&2_800));
     }
 
     #[test]
-    fn test_pid_reuse_resets_and_ignores_negative_delta() {
+    fn test_reused_pid_with_new_start_time_resets_baseline_and_emits_zero() {
         let mut prev = HashMap::new();
-        let pid1 = Pid::from(200);
+        let pid = Pid::from(200);
+        let old_key = (pid, 10_000u64);
+        let new_key = (pid, 20_000u64);
 
         // Previous process had written 10 MB
-        prev.insert(pid1, 10_000_000);
+        prev.insert(old_key, 10_000_000);
 
-        // Process terminated, new process got reused PID 200 and has only written 500 bytes
-        let current = vec![(pid1, "new_process.exe".to_string(), 500)];
+        // Process terminated, new process got reused PID 200 with new start_time 20_000
+        let current = vec![(new_key, "new_process.exe".to_string(), 500)];
 
         let deltas = calculate_deltas(&mut prev, &current);
 
-        // Negative delta should be skipped / ignored, so result is empty
-        assert!(deltas.is_empty());
+        // Negative delta / PID reuse with new start_time should emit 0 deltas
+        assert!(deltas.is_empty(), "First sighting of reused PID with new start_time must emit 0");
 
-        // Baseline should be reset to the new process's current reading
-        assert_eq!(prev.get(&pid1), Some(&500));
+        // Baseline should be stored for the new key
+        assert_eq!(prev.get(&new_key), Some(&500));
 
         // On subsequent poll, delta should be computed against the new baseline
-        let next_poll = vec![(pid1, "new_process.exe".to_string(), 1_200)];
+        let next_poll = vec![(new_key, "new_process.exe".to_string(), 1_200)];
         let deltas2 = calculate_deltas(&mut prev, &next_poll);
         assert_eq!(deltas2, vec![("new_process.exe".to_string(), 700)]);
-        assert_eq!(prev.get(&pid1), Some(&1_200));
+        assert_eq!(prev.get(&new_key), Some(&1_200));
+    }
+
+    #[test]
+    fn test_negative_deltas_are_skipped() {
+        let mut prev = HashMap::new();
+        let key = (Pid::from(300), 5_000u64);
+        prev.insert(key, 10_000);
+
+        // Current written is less than prev (e.g. counter wrap or anomalous decrease)
+        let current = vec![(key, "service.exe".to_string(), 2_000)];
+        let deltas = calculate_deltas(&mut prev, &current);
+
+        assert!(deltas.is_empty(), "Negative delta must be skipped");
+        assert_eq!(prev.get(&key), Some(&2_000));
+
+        // Subsequent increase is captured from new baseline
+        let next = vec![(key, "service.exe".to_string(), 2_500)];
+        let deltas2 = calculate_deltas(&mut prev, &next);
+        assert_eq!(deltas2, vec![("service.exe".to_string(), 500)]);
+    }
+
+    #[test]
+    fn test_normalization_against_ssd_interval_delta() {
+        let proc_deltas = vec![
+            ("proc_a.exe".to_string(), 200),
+            ("proc_b.exe".to_string(), 800),
+        ];
+        let ssd_delta = 50_000;
+
+        // Sum = 1000.
+        // proc_a: 200 / 1000 = 0.20 -> 0.20 * 50_000 = 10_000
+        // proc_b: 800 / 1000 = 0.80 -> 0.80 * 50_000 = 40_000
+        let normalized = normalize_process_deltas(&proc_deltas, ssd_delta);
+
+        assert_eq!(normalized.len(), 2);
+        assert_eq!(normalized[0], ("proc_b.exe".to_string(), 40_000));
+        assert_eq!(normalized[1], ("proc_a.exe".to_string(), 10_000));
+    }
+
+    #[test]
+    fn test_zero_ssd_delta_records_no_shares() {
+        let proc_deltas = vec![
+            ("proc_a.exe".to_string(), 1_000_000),
+            ("proc_b.exe".to_string(), 500_000),
+        ];
+        let normalized = normalize_process_deltas(&proc_deltas, 0);
+        assert!(normalized.is_empty(), "Zero SSD delta must record no shares");
     }
 
     #[test]
     fn test_multiple_processes_same_name_aggregating() {
         let mut prev = HashMap::new();
-        let p1 = Pid::from(10);
-        let p2 = Pid::from(20);
-        let p3 = Pid::from(30);
+        let p1 = (Pid::from(10), 1_000u64);
+        let p2 = (Pid::from(20), 2_000u64);
+        let p3 = (Pid::from(30), 3_000u64);
 
         prev.insert(p1, 100);
         prev.insert(p2, 200);
@@ -287,32 +413,10 @@ mod tests {
     }
 
     #[test]
-    fn test_new_pid_appearing_for_first_time() {
-        let mut prev = HashMap::new();
-        let pid = Pid::from(999);
-
-        // New PID not present in prev_readings
-        let current = vec![(pid, "background_service.exe".to_string(), 50_000)];
-
-        let deltas = calculate_deltas(&mut prev, &current);
-
-        // Since there is no prior baseline, delta is 0 / ignored to avoid false write spike
-        assert!(deltas.is_empty());
-
-        // Baseline should now be stored in prev
-        assert_eq!(prev.get(&pid), Some(&50_000));
-
-        // Next poll computes the delta accurately
-        let next = vec![(pid, "background_service.exe".to_string(), 55_000)];
-        let deltas2 = calculate_deltas(&mut prev, &next);
-        assert_eq!(deltas2, vec![("background_service.exe".to_string(), 5_000)]);
-    }
-
-    #[test]
     fn test_zero_delta_filtered_out() {
         let mut prev = HashMap::new();
-        let pid1 = Pid::from(100);
-        let pid2 = Pid::from(101);
+        let pid1 = (Pid::from(100), 1_000u64);
+        let pid2 = (Pid::from(101), 2_000u64);
 
         prev.insert(pid1, 1_000);
         prev.insert(pid2, 2_000);
@@ -332,7 +436,6 @@ mod tests {
     fn test_proc_collector_live_instantiation() {
         let mut collector = ProcCollector::new();
         let deltas = collector.poll_deltas();
-        // Should execute without panicking; deltas could be empty or non-empty depending on system activity
         crate::logger::log_debug(&format!("Collected {} process deltas in test", deltas.len()));
     }
 }

@@ -1,6 +1,4 @@
 use std::sync::Arc;
-
-use chrono::NaiveDate;
 use egui::{Color32, RichText, Stroke};
 
 use crate::app_core::{AppState, DriveConfig, Settings};
@@ -98,6 +96,25 @@ pub fn format_percentage(pct: Option<u8>) -> String {
     }
 }
 
+/// Formats a list of 24h snapshot intervals into CSV format with standard headers.
+pub fn format_intervals_csv(intervals: &[crate::db::SnapshotInterval]) -> String {
+    let mut csv = String::from("timestamp,formatted_time,raw_data_units_written,delta_gb,attribution\n");
+    for interval in intervals {
+        let formatted_time = chrono::DateTime::from_timestamp(interval.timestamp, 0)
+            .map(|dt| dt.with_timezone(&chrono::Local).format("%Y-%m-%d %H:%M:%S").to_string())
+            .unwrap_or_else(|| interval.timestamp.to_string());
+        csv.push_str(&format!(
+            "{},{},{},{:.4},{}\n",
+            interval.timestamp,
+            formatted_time,
+            interval.raw_data_units_written,
+            interval.delta_gb,
+            interval.attribution,
+        ));
+    }
+    csv
+}
+
 /// The main Estus UI application.
 pub type EstusApp = SsdWatchApp;
 
@@ -111,7 +128,9 @@ pub struct SsdWatchApp {
     pub temp_verbose_logging: bool,
     pub temp_drive_nicknames: std::collections::HashMap<String, String>,
     pub temp_drive_enabled: std::collections::HashMap<String, bool>,
+    pub confirm_reset_history: bool,
     pub settings_status_msg: Option<(String, bool)>,
+    pub csv_status_msg: Option<(String, bool)>,
     pub _tray: Option<tray_icon::TrayIcon>,
     pub _show_id: Option<tray_icon::menu::MenuId>,
     pub _quit_id: Option<tray_icon::menu::MenuId>,
@@ -152,7 +171,9 @@ impl SsdWatchApp {
             temp_verbose_logging: verbose_logging,
             temp_drive_nicknames: std::collections::HashMap::new(),
             temp_drive_enabled: std::collections::HashMap::new(),
+            confirm_reset_history: false,
             settings_status_msg: None,
+            csv_status_msg: None,
             _tray: None,
             _show_id: None,
             _quit_id: None,
@@ -244,6 +265,7 @@ impl eframe::App for SsdWatchApp {
         // Check if an exit was requested
         if let Ok(s) = self.state.lock()
             && s.should_quit {
+                crate::app_core::take_exit_snapshot(&self.state);
                 ui.ctx().send_viewport_cmd(egui::ViewportCommand::Close);
                 std::process::exit(0);
             }
@@ -271,6 +293,7 @@ impl eframe::App for SsdWatchApp {
             selected_drive_id,
             selected_snapshot,
             selected_daily_writes,
+            selected_intervals_24h,
             per_drive_snapshots,
             smart_error,
             top_today,
@@ -290,6 +313,7 @@ impl eframe::App for SsdWatchApp {
                     s.selected_drive_id.clone(),
                     s.get_selected_snapshot().cloned(),
                     s.get_selected_daily_writes().to_vec(),
+                    s.get_selected_intervals_24h().to_vec(),
                     s.per_drive_snapshots.clone(),
                     s.smart_error.clone(),
                     s.top_processes_today.clone(),
@@ -398,6 +422,8 @@ impl eframe::App for SsdWatchApp {
                     active_dev.as_deref(),
                     last_raw_err.as_deref(),
                     last_raw_output.as_deref(),
+                    selected_drive_id.as_deref(),
+                    &selected_intervals_24h,
                 );
 
                 ui.add_space(16.0);
@@ -558,7 +584,9 @@ fn render_status_area(
         });
 }
 
-/// Renders a dedicated Diagnostics panel showing resolved smartctl path, version, last error, raw output, Browse button, and Re-detect button.
+/// Renders a dedicated Diagnostics panel showing resolved smartctl path, version, last error, raw output, Browse button, Re-detect button,
+/// and 24-hour snapshot write intervals table with CSV export.
+#[allow(clippy::too_many_arguments)]
 fn render_diagnostics_panel(
     ui: &mut egui::Ui,
     app: &mut SsdWatchApp,
@@ -567,6 +595,8 @@ fn render_diagnostics_panel(
     active_device: Option<&str>,
     last_raw_error: Option<&str>,
     last_raw_output: Option<&str>,
+    selected_drive_id: Option<&str>,
+    intervals: &[crate::db::SnapshotInterval],
 ) {
     egui::CollapsingHeader::new(
         RichText::new("🛠 Diagnostics")
@@ -640,6 +670,185 @@ fn render_diagnostics_panel(
                                 .desired_width(f32::INFINITY)
                                 .interactive(false),
                         );
+                    });
+
+                ui.add_space(16.0);
+                ui.separator();
+                ui.add_space(10.0);
+
+                // Intervals (Last 24 Hours) Table Section
+                ui.horizontal(|ui| {
+                    ui.label(
+                        RichText::new("Intervals (Last 24 Hours)")
+                            .size(13.0)
+                            .strong()
+                            .color(Color32::from_rgb(200, 205, 220)),
+                    );
+
+                    ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                        if ui
+                            .button("💾 Export CSV")
+                            .on_hover_text("Export last 24 hours write intervals to a CSV file")
+                            .clicked()
+                            && let Some(file_path) = rfd::FileDialog::new()
+                                .add_filter("CSV Files", &["csv"])
+                                .set_file_name("estus_intervals_24h.csv")
+                                .save_file()
+                        {
+                            let export_intervals = if !intervals.is_empty() {
+                                intervals.to_vec()
+                            } else if let Ok(conn) = crate::db::init_db() {
+                                crate::db::get_intervals_24h(&conn, selected_drive_id).unwrap_or_default()
+                            } else {
+                                Vec::new()
+                            };
+
+                            let csv_content = format_intervals_csv(&export_intervals);
+                            match std::fs::write(&file_path, csv_content) {
+                                Ok(()) => {
+                                    crate::logger::log_info(&format!(
+                                        "Exported 24h intervals to CSV: {}",
+                                        file_path.display()
+                                    ));
+                                    let _ = notify_rust::Notification::new()
+                                        .appname("Estus")
+                                        .summary("CSV Export Successful")
+                                        .body(&format!(
+                                            "Saved {} interval(s) to {}",
+                                            export_intervals.len(),
+                                            file_path.display()
+                                        ))
+                                        .show();
+                                    app.csv_status_msg = Some((
+                                        format!(
+                                            "✓ Exported {} interval(s) to {}",
+                                            export_intervals.len(),
+                                            file_path.display()
+                                        ),
+                                        false,
+                                    ));
+                                }
+                                Err(e) => {
+                                    crate::logger::log_error(&format!(
+                                        "Failed to write CSV to {}: {e}",
+                                        file_path.display()
+                                    ));
+                                    app.csv_status_msg = Some((
+                                        format!("✗ Failed to export CSV: {e}"),
+                                        true,
+                                    ));
+                                }
+                            }
+                        }
+                    });
+                });
+
+                if let Some((ref msg, is_err)) = app.csv_status_msg {
+                    ui.add_space(4.0);
+                    let color = if is_err {
+                        Color32::from_rgb(255, 100, 100)
+                    } else {
+                        Color32::from_rgb(100, 220, 120)
+                    };
+                    ui.label(RichText::new(msg).color(color).strong());
+                }
+
+                ui.add_space(6.0);
+
+                egui::ScrollArea::vertical()
+                    .max_height(220.0)
+                    .show(ui, |ui| {
+                        egui::Grid::new("diagnostics_intervals_grid")
+                            .striped(true)
+                            .min_col_width(80.0)
+                            .spacing([18.0, 6.0])
+                            .show(ui, |ui| {
+                                ui.label(
+                                    RichText::new("Local Time")
+                                        .strong()
+                                        .color(Color32::from_rgb(160, 165, 180)),
+                                );
+                                ui.label(
+                                    RichText::new("Raw Data Units Written")
+                                        .strong()
+                                        .color(Color32::from_rgb(160, 165, 180)),
+                                );
+                                ui.label(
+                                    RichText::new("Delta (GB)")
+                                        .strong()
+                                        .color(Color32::from_rgb(160, 165, 180)),
+                                );
+                                ui.label(
+                                    RichText::new("Attribution")
+                                        .strong()
+                                        .color(Color32::from_rgb(160, 165, 180)),
+                                );
+                                ui.end_row();
+
+                                if intervals.is_empty() {
+                                    ui.label(
+                                        RichText::new("No intervals recorded in the last 24 hours.")
+                                            .color(Color32::GRAY)
+                                            .italics(),
+                                    );
+                                    ui.end_row();
+                                } else {
+                                    for interval in intervals.iter().rev() {
+                                        let time_str = chrono::DateTime::from_timestamp(interval.timestamp, 0)
+                                            .map(|dt| {
+                                                dt.with_timezone(&chrono::Local)
+                                                    .format("%Y-%m-%d %H:%M:%S")
+                                                    .to_string()
+                                            })
+                                            .unwrap_or_else(|| interval.timestamp.to_string());
+
+                                        ui.monospace(
+                                            RichText::new(time_str)
+                                                .color(Color32::from_rgb(140, 180, 220)),
+                                        );
+                                        ui.monospace(
+                                            RichText::new(format_with_commas(
+                                                interval.raw_data_units_written,
+                                            ))
+                                            .color(Color32::from_rgb(200, 205, 215)),
+                                        );
+
+                                        let delta_str = if interval.delta_gb > 0.0 {
+                                            format!("+{:.2} GB", interval.delta_gb)
+                                        } else {
+                                            "0.00 GB".to_string()
+                                        };
+                                        let delta_color = if interval.delta_gb >= 1.0 {
+                                            Color32::from_rgb(255, 160, 80)
+                                        } else if interval.delta_gb > 0.0 {
+                                            Color32::from_rgb(120, 225, 150)
+                                        } else {
+                                            Color32::from_rgb(150, 155, 165)
+                                        };
+                                        ui.monospace(
+                                            RichText::new(delta_str).strong().color(delta_color),
+                                        );
+
+                                        let (attrib_color, attrib_text) =
+                                            if interval.attribution == "app not running" {
+                                                (
+                                                    Color32::from_rgb(245, 158, 11),
+                                                    interval.attribution.as_str(),
+                                                )
+                                            } else if interval.attribution == "baseline" {
+                                                (Color32::GRAY, interval.attribution.as_str())
+                                            } else {
+                                                (
+                                                    Color32::from_rgb(160, 210, 180),
+                                                    interval.attribution.as_str(),
+                                                )
+                                            };
+                                        ui.label(RichText::new(attrib_text).color(attrib_color));
+
+                                        ui.end_row();
+                                    }
+                                }
+                            });
                     });
             });
     });
@@ -816,7 +1025,7 @@ fn render_metric_cards(
     ui: &mut egui::Ui,
     selected_drive: Option<&DriveInfo>,
     selected_snapshot: Option<&SmartSnapshot>,
-    daily_writes: &[(NaiveDate, u64)],
+    daily_writes: &[crate::db::DailyWrites],
     detected_drives: &[DriveInfo],
     per_drive_snapshots: &std::collections::HashMap<String, SmartSnapshot>,
     settings: &Settings,
@@ -824,22 +1033,33 @@ fn render_metric_cards(
     let today = chrono::Local::now().date_naive();
     let threshold_gb = settings.alert_threshold_gb;
 
-    let today_bytes = daily_writes
+    let today_entry = daily_writes
         .iter()
-        .find(|(d, _)| *d == today)
-        .map(|(_, b)| *b)
-        .unwrap_or(0);
+        .find(|dw| dw.date == today);
+    let today_active = today_entry.map(|dw| dw.active_bytes).unwrap_or(0);
+    let today_gap = today_entry.map(|dw| dw.gap_bytes).unwrap_or(0);
+    let today_bytes = today_entry.map(|dw| dw.total_bytes()).unwrap_or(0);
     let today_gb = today_bytes as f64 / crate::analytics::BYTES_PER_GB;
 
     let (today_color, today_subtext) = if crate::analytics::is_daily_threshold_exceeded(today_bytes, threshold_gb) {
+        let sub = if today_gap > 0 {
+            format!("Alert: {:.1} GB > {:.0} GB limit ({:.1} GB offline)", today_gb, threshold_gb, today_gap as f64 / crate::analytics::BYTES_PER_GB)
+        } else {
+            format!("Alert: {:.1} GB > {:.0} GB limit", today_gb, threshold_gb)
+        };
         (
             Color32::from_rgb(244, 67, 54),
-            format!("Alert: {:.1} GB > {:.0} GB limit", today_gb, threshold_gb),
+            sub,
         )
     } else {
+        let sub = if today_gap > 0 {
+            format!("Active: {:.1} GB | Offline: {:.1} GB", today_active as f64 / crate::analytics::BYTES_PER_GB, today_gap as f64 / crate::analytics::BYTES_PER_GB)
+        } else {
+            format!("Daily limit: {:.0} GB ({:.1} GB left)", threshold_gb, (threshold_gb - today_gb).max(0.0))
+        };
         (
             Color32::from_rgb(72, 199, 142),
-            format!("Daily limit: {:.0} GB ({:.1} GB left)", threshold_gb, (threshold_gb - today_gb).max(0.0)),
+            sub,
         )
     };
 
@@ -1076,10 +1296,11 @@ fn render_metric_cards(
 }
 
 /// Renders the 30-day daily writes bar chart using `egui_plot`.
+/// Displays active writes and offline gap writes ("while Estus was not running") as stacked bar segments.
 fn render_chart_section(
     ui: &mut egui::Ui,
     selected_drive: Option<&DriveInfo>,
-    daily_writes: &[(NaiveDate, u64)],
+    daily_writes: &[crate::db::DailyWrites],
 ) {
     egui::Frame::group(ui.style())
         .fill(Color32::from_rgb(28, 30, 36))
@@ -1094,12 +1315,27 @@ fn render_chart_section(
                 "DAILY WRITES (LAST 30 DAYS) — All Drives".to_string()
             };
 
-            ui.label(
-                RichText::new(title)
-                    .size(12.0)
-                    .strong()
-                    .color(Color32::from_rgb(180, 185, 200)),
-            );
+            ui.horizontal(|ui| {
+                ui.label(
+                    RichText::new(title)
+                        .size(12.0)
+                        .strong()
+                        .color(Color32::from_rgb(180, 185, 200)),
+                );
+                ui.with_layout(egui::Layout::right_to_left(egui::Align::Center), |ui| {
+                    ui.label(
+                        RichText::new("■ Offline gap")
+                            .small()
+                            .color(Color32::from_rgb(245, 158, 11)),
+                    );
+                    ui.add_space(8.0);
+                    ui.label(
+                        RichText::new("■ Active writes")
+                            .small()
+                            .color(Color32::from_rgb(59, 130, 246)),
+                    );
+                });
+            });
             ui.add_space(6.0);
 
             if daily_writes.is_empty() {
@@ -1112,29 +1348,55 @@ fn render_chart_section(
                 );
             } else {
                 let mut sorted = daily_writes.to_vec();
-                sorted.sort_by_key(|(d, _)| *d);
+                sorted.sort_by_key(|dw| dw.date);
                 let start_idx = sorted.len().saturating_sub(30);
                 let recent = &sorted[start_idx..];
 
                 let date_labels: Vec<String> = recent
                     .iter()
-                    .map(|(d, _)| d.format("%m/%d").to_string())
+                    .map(|dw| dw.date.format("%m/%d").to_string())
                     .collect();
 
-                let mut bars = Vec::with_capacity(recent.len());
-                for (idx, (d, bytes)) in recent.iter().enumerate() {
-                    let gb = *bytes as f64 / crate::analytics::BYTES_PER_GB;
-                    let label = format!("{}: {:.2} GB", d.format("%b %d, %Y"), gb);
-                    let bar = egui_plot::Bar::new(idx as f64, gb)
-                        .name(label)
+                let mut active_bars = Vec::with_capacity(recent.len());
+                let mut gap_bars = Vec::with_capacity(recent.len());
+
+                for (idx, dw) in recent.iter().enumerate() {
+                    let active_gb = dw.active_bytes as f64 / crate::analytics::BYTES_PER_GB;
+                    let gap_gb = dw.gap_bytes as f64 / crate::analytics::BYTES_PER_GB;
+                    let total_gb = dw.total_bytes() as f64 / crate::analytics::BYTES_PER_GB;
+
+                    let active_label = format!(
+                        "{}: Active {:.2} GB (Total: {:.2} GB)",
+                        dw.date.format("%b %d, %Y"),
+                        active_gb,
+                        total_gb
+                    );
+                    let active_bar = egui_plot::Bar::new(idx as f64, active_gb)
+                        .name(active_label)
                         .width(0.65)
                         .fill(Color32::from_rgb(59, 130, 246));
-                    bars.push(bar);
+                    active_bars.push(active_bar);
+
+                    let gap_label = format!(
+                        "{}: Offline {:.2} GB (while Estus was not running)",
+                        dw.date.format("%b %d, %Y"),
+                        gap_gb
+                    );
+                    let gap_bar = egui_plot::Bar::new(idx as f64, gap_gb)
+                        .base_offset(active_gb)
+                        .name(gap_label)
+                        .width(0.65)
+                        .fill(Color32::from_rgb(245, 158, 11));
+                    gap_bars.push(gap_bar);
                 }
 
-                let chart = egui_plot::BarChart::new("Daily Writes", bars)
+                let active_chart = egui_plot::BarChart::new("Active writes", active_bars)
                     .width(0.65)
                     .color(Color32::from_rgb(59, 130, 246));
+
+                let gap_chart = egui_plot::BarChart::new("Offline gap", gap_bars)
+                    .width(0.65)
+                    .color(Color32::from_rgb(245, 158, 11));
 
                 let labels_arc = Arc::new(date_labels);
                 let labels_formatter = Arc::clone(&labels_arc);
@@ -1143,6 +1405,11 @@ fn render_chart_section(
                     .height(180.0)
                     .show_axes([true, true])
                     .show_grid([true, true])
+                    .legend(
+                        egui_plot::Legend::default()
+                            .position(egui_plot::Corner::RightTop)
+                            .background_alpha(0.7),
+                    )
                     .y_axis_label("GB Written")
                     .x_axis_label("Date")
                     .allow_zoom(false)
@@ -1160,7 +1427,8 @@ fn render_chart_section(
                         }
                     })
                     .show(ui, |plot_ui| {
-                        plot_ui.bar_chart(chart);
+                        plot_ui.bar_chart(active_chart);
+                        plot_ui.bar_chart(gap_chart);
                     });
             }
         });
@@ -1249,12 +1517,7 @@ fn render_process_table(
                                 .color(Color32::from_rgb(160, 165, 180)),
                         );
                         ui.label(
-                            RichText::new("Bytes Written")
-                                .strong()
-                                .color(Color32::from_rgb(160, 165, 180)),
-                        );
-                        ui.label(
-                            RichText::new("% of Total")
+                            RichText::new("Share of writes (estimated)")
                                 .strong()
                                 .color(Color32::from_rgb(160, 165, 180)),
                         );
@@ -1269,8 +1532,7 @@ fn render_process_table(
 
                             ui.label(RichText::new(format!("#{}", idx + 1)).strong());
                             ui.monospace(name);
-                            ui.label(format_bytes(*bytes));
-                            ui.label(format!("{:.1}%", pct));
+                            ui.label(format!("{:.1}% ({})", pct, format_bytes(*bytes)));
                             ui.end_row();
                         }
                     });
@@ -1527,6 +1789,94 @@ fn render_settings_panel(ui: &mut egui::Ui, app: &mut SsdWatchApp, detected_driv
                     }
                 });
 
+                ui.add_space(10.0);
+                ui.separator();
+                ui.add_space(8.0);
+
+                ui.label(
+                    RichText::new("Data Management:")
+                        .strong()
+                        .color(Color32::from_rgb(180, 185, 200)),
+                );
+                ui.add_space(4.0);
+
+                if !app.confirm_reset_history {
+                    if ui
+                        .button(
+                            RichText::new("Reset history")
+                                .color(Color32::from_rgb(240, 120, 120)),
+                        )
+                        .on_hover_text("Purges process writes and retains only the latest baseline snapshot for each drive")
+                        .clicked()
+                    {
+                        app.confirm_reset_history = true;
+                    }
+                } else {
+                    egui::Frame::group(ui.style())
+                        .fill(Color32::from_rgb(38, 25, 25))
+                        .stroke(Stroke::new(1.0, Color32::from_rgb(180, 60, 60)))
+                        .corner_radius(4.0)
+                        .inner_margin(8.0)
+                        .show(ui, |ui| {
+                            ui.label(
+                                RichText::new(
+                                    "Are you sure you want to reset all write history? This cannot be undone.",
+                                )
+                                .color(Color32::from_rgb(255, 150, 150))
+                                .strong(),
+                            );
+                            ui.add_space(6.0);
+                            ui.horizontal(|ui| {
+                                if ui
+                                    .button(
+                                        RichText::new("Confirm Reset")
+                                            .color(Color32::from_rgb(255, 80, 80))
+                                            .strong(),
+                                    )
+                                    .clicked()
+                                {
+                                    app.confirm_reset_history = false;
+                                    match crate::db::init_db() {
+                                        Ok(conn) => match crate::db::reset_history(&conn) {
+                                            Ok(()) => {
+                                                if let Ok(mut s) = app.state.lock() {
+                                                    s.daily_writes.clear();
+                                                    s.per_drive_daily_writes.clear();
+                                                    s.intervals_24h.clear();
+                                                    s.per_drive_intervals.clear();
+                                                    s.top_processes_today.clear();
+                                                    s.top_processes_7d.clear();
+                                                    s.top_processes_30d.clear();
+                                                    s.data_changed = true;
+                                                }
+                                                app.settings_status_msg = Some((
+                                                    "✓ Write history reset successfully. Baseline established.".to_string(),
+                                                    false,
+                                                ));
+                                                app.trigger_refresh();
+                                            }
+                                            Err(e) => {
+                                                app.settings_status_msg = Some((
+                                                    format!("✗ Failed to reset history: {e}"),
+                                                    true,
+                                                ));
+                                            }
+                                        },
+                                        Err(e) => {
+                                            app.settings_status_msg = Some((
+                                                format!("✗ Failed to open database: {e}"),
+                                                true,
+                                            ));
+                                        }
+                                    }
+                                }
+                                if ui.button("Cancel").clicked() {
+                                    app.confirm_reset_history = false;
+                                }
+                            });
+                        });
+                }
+
                 if let Some((ref msg, is_err)) = app.settings_status_msg {
                     ui.add_space(6.0);
                     let color = if is_err {
@@ -1633,6 +1983,7 @@ mod tests {
         assert!(app.autostart_system_configured);
         assert!(app.temp_verbose_logging);
         assert_eq!(app.settings_status_msg, None);
+        assert_eq!(app.csv_status_msg, None);
     }
 
     #[test]
@@ -1654,6 +2005,7 @@ mod tests {
         assert!(!app.autostart_system_configured);
         assert!(!app.temp_verbose_logging);
         assert_eq!(app.settings_status_msg, None);
+        assert_eq!(app.csv_status_msg, None);
     }
 
     #[test]
@@ -1683,5 +2035,63 @@ mod tests {
 
         app.sync_autostart_with_system();
         assert_eq!(app.temp_start_with_windows, app.autostart_system_configured);
+    }
+
+    #[test]
+    fn test_ssd_watch_app_confirm_reset_history_lifecycle() {
+        let settings = Settings::default();
+        let state = new_app_state(settings);
+        let mut app = SsdWatchApp::new(state);
+
+        assert!(!app.confirm_reset_history);
+        app.confirm_reset_history = true;
+        assert!(app.confirm_reset_history);
+
+        app.confirm_reset_history = false;
+        assert!(!app.confirm_reset_history);
+    }
+
+    #[test]
+    fn test_format_intervals_csv_empty() {
+        let csv = format_intervals_csv(&[]);
+        assert_eq!(csv, "timestamp,formatted_time,raw_data_units_written,delta_gb,attribution\n");
+    }
+
+    #[test]
+    fn test_format_intervals_csv_populated() {
+        let intervals = vec![
+            crate::db::SnapshotInterval {
+                timestamp: 1700000000,
+                raw_data_units_written: 10000,
+                delta_gb: 0.0,
+                attribution: "baseline".to_string(),
+            },
+            crate::db::SnapshotInterval {
+                timestamp: 1700000300,
+                raw_data_units_written: 10500,
+                delta_gb: 0.2560,
+                attribution: "2026-11-24".to_string(),
+            },
+            crate::db::SnapshotInterval {
+                timestamp: 1700002000,
+                raw_data_units_written: 11000,
+                delta_gb: 0.2560,
+                attribution: "app not running".to_string(),
+            },
+        ];
+
+        let csv = format_intervals_csv(&intervals);
+        let lines: Vec<&str> = csv.lines().collect();
+        assert_eq!(lines.len(), 4);
+        assert_eq!(lines[0], "timestamp,formatted_time,raw_data_units_written,delta_gb,attribution");
+
+        assert!(lines[1].starts_with("1700000000,"));
+        assert!(lines[1].ends_with(",10000,0.0000,baseline"));
+
+        assert!(lines[2].starts_with("1700000300,"));
+        assert!(lines[2].ends_with(",10500,0.2560,2026-11-24"));
+
+        assert!(lines[3].starts_with("1700002000,"));
+        assert!(lines[3].ends_with(",11000,0.2560,app not running"));
     }
 }

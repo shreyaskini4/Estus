@@ -66,14 +66,15 @@ fn main() -> eframe::Result<()> {
     };
 
     let single_instance_main = Arc::clone(&single_instance);
+    let state_for_ui = Arc::clone(&state);
     let res = eframe::run_native(
         "Estus",
         native_options,
         Box::new(move |cc| {
-            let mut app = ui::EstusApp::new(Arc::clone(&state));
+            let mut app = ui::EstusApp::new(Arc::clone(&state_for_ui));
 
             // Spawn activation event listener thread so external launches restore/focus this instance
-            let act_state = Arc::clone(&state);
+            let act_state = Arc::clone(&state_for_ui);
             let act_ctx = cc.egui_ctx.clone();
             let act_guard = Arc::clone(&single_instance);
             std::thread::Builder::new()
@@ -97,7 +98,7 @@ fn main() -> eframe::Result<()> {
 
             if let Some((tray, show_id, quit_id)) = tray_bundle {
                 // Spawn tray event handler thread with egui Context so tray clicks instantly wake and show UI
-                let state_clone = Arc::clone(&state);
+                let state_clone = Arc::clone(&state_for_ui);
                 let ctx_clone = cc.egui_ctx.clone();
                 let show_id_clone = show_id.clone();
                 let quit_id_clone = quit_id.clone();
@@ -113,6 +114,7 @@ fn main() -> eframe::Result<()> {
                         }
                         if let Ok(s) = state_clone.lock()
                             && s.should_quit {
+                                app_core::take_exit_snapshot(&state_clone);
                                 ctx_clone.send_viewport_cmd(egui::ViewportCommand::Close);
                                 std::process::exit(0);
                             }
@@ -127,6 +129,9 @@ fn main() -> eframe::Result<()> {
             Ok(Box::new(app))
         }),
     );
+
+    // Take a final snapshot on graceful app exit
+    app_core::take_exit_snapshot(&state);
 
     // Keep primary instance mutex guard alive until process exit
     drop(single_instance_main);
