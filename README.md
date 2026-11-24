@@ -1,8 +1,33 @@
 # Estus
 
+[![GitHub Release](https://img.shields.io/github/v/release/shreyaskini4/Estus)](https://github.com/shreyaskini4/Estus/releases)
+
 A lightweight, native Windows desktop application written in Rust that monitors and analyzes what is wearing out your NVMe SSD.
 
 Designed with a focus on efficiency: **single small executable**, **negligible CPU and RAM overhead**, **zero web technology** (no Electron, no WebView, no Chromium).
+
+---
+
+## Download & Quick Start
+
+Pre-built releases are available on the [GitHub Releases](https://github.com/shreyaskini4/Estus/releases) page:
+
+1. **Download**: Go to [GitHub Releases](https://github.com/shreyaskini4/Estus/releases) and download the latest `Estus-<version>-windows-x64.zip` and the `.sha256` checksum file.
+2. **Verify (Optional)**: Verify SHA256 integrity in PowerShell:
+   ```powershell
+   Get-FileHash .\Estus-*-windows-x64.zip -Algorithm SHA256
+   ```
+   Compare the output against the checksum in `.sha256`.
+3. **Extract**: Extract the zip file to any folder on your machine.
+4. **Install `smartmontools`** (if not already installed):
+   ```powershell
+   winget install smartmontools.smartmontools
+   ```
+   *(or `winget install smartmontools`)*
+5. **Run**: Right-click `estus.exe` and select **"Run as administrator"** (or double-click; Estus embeds a manifest that automatically requests administrator elevation via UAC).
+
+> [!NOTE]
+> **Windows SmartScreen**: Because Estus is an open-source tool without a commercial code-signing certificate, Windows SmartScreen may show an initial warning banner ("Windows protected your PC"). Click **"More info"**, then click **"Run anyway"**.
 
 ---
 
@@ -20,24 +45,6 @@ Designed with a focus on efficiency: **single small executable**, **negligible C
 - **Autostart with Windows**: Native Windows Task Scheduler integration (`schtasks /Create /RL HIGHEST /SC ONLOGON`) bypassing UAC registry blocks, starting silently to the system tray on logon.
 - **Embedded SQLite Storage**: Built-in SQLite database using WAL mode (`PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL;`) in the user data directory, automatically migrating schemas and pruning process writes older than 90 days.
 - **Ultra-low CPU Usage**: Processes are sampled using `sysinfo` with disk-usage-only polling every 30 seconds. The GUI repaints only on data changes or at most once per second, keeping idle CPU near 0%.
-
----
-
-## Installation & Setup
-
-### 1. Install `smartmontools`
-Estus uses `smartctl` to read low-level NVMe SMART health metrics. Install it via Windows Package Manager (`winget`):
-
-```powershell
-winget install smartmontools.smartmontools
-```
-
-*Alternatively, download the installer directly from [smartmontools.org](https://www.smartmontools.org/) and ensure `smartctl.exe` is in your system `PATH`.*
-
-### 2. Run as Administrator
-Accessing raw NVMe hardware SMART logs on Windows requires elevated administrator privileges:
-- The release binary includes an **embedded Windows application manifest** that automatically triggers the Windows UAC (User Account Control) prompt requesting administrator rights (`requireAdministrator`).
-- If launching from a terminal or custom shortcut, ensure it is executed from an elevated shell or with "Run as Administrator".
 
 ---
 
@@ -99,7 +106,7 @@ src/
 
 ---
 
-## Building from Source
+## Building from Source (For Developers)
 
 Estus is designed to be fully portable and easy to build on any 64-bit Windows machine. You can set up and build using our automated scripts or manually configure your environment.
 
@@ -271,6 +278,12 @@ Common issues and their solutions when setting up, building, or running Estus:
 | **`smartctl not detected`** | `smartctl.exe` is not installed or not in your `PATH` or registry. | Run `winget install smartmontools.smartmontools` or download the installer from [smartmontools.org](https://www.smartmontools.org/). Alternatively, open the **Diagnostics** panel inside Estus and click **Browse...** to select your `smartctl.exe` binary. |
 | **`winget : The term 'winget' is not recognized`** | Windows Package Manager is not present on this Windows installation. | Install **App Installer** from the Microsoft Store, or download the latest `.msixbundle` from the official [winget-cli GitHub repository](https://github.com/microsoft/winget-cli). |
 | **`running scripts is disabled on this system`** | PowerShell script execution policy restricts running `.ps1` files. | Run `setup.bat` directly (which automatically executes PowerShell with `-ExecutionPolicy Bypass`), or run `Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass` in your PowerShell terminal. |
+
+---
+
+## Releasing
+
+For maintainer release instructions, see [RELEASING.md](RELEASING.md).
 
 ---
 

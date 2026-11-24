@@ -1,0 +1,63 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      tag_name:
+        description: 'Release tag (e.g. v0.1.0)'
+        required: false
+        default: ''
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    name: Build and Release
+    runs-on: windows-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Rust cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build release binary
+        run: cargo build --release
+
+      - name: Package release artifacts
+        shell: powershell
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          INPUT_TAG: ${{ inputs.tag_name }}
+          REF_NAME: ${{ github.ref_name }}
+        run: |
+          $tag = if ($env:EVENT_NAME -eq 'workflow_dispatch' -and -not [string]::IsNullOrWhiteSpace($env:INPUT_TAG)) {
+            $env:INPUT_TAG
+          } else {
+            $env:REF_NAME
+          }
+          $zipName = "Estus-$tag-windows-x64.zip"
+          Compress-Archive -Path target\release\estus.exe, README.md -DestinationPath $zipName -Force
+          $hash = (Get-FileHash $zipName -Algorithm SHA256).Hash.ToLower()
+          Set-Content -Path "$zipName.sha256" -Value "$hash  $zipName"
+          echo "TAG_NAME=$tag" >> $env:GITHUB_ENV
+          echo "ZIP_NAME=$zipName" >> $env:GITHUB_ENV
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ env.TAG_NAME }}
+          files: |
+            ${{ env.ZIP_NAME }}
+            ${{ env.ZIP_NAME }}.sha256
+          generate_release_notes: true
