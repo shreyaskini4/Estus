@@ -192,6 +192,7 @@ pub struct SsdWatchApp {
     pub gauge_anim_start: Option<Instant>,
     pub prev_anim_key: Option<(Option<String>, u8)>,
     pub shimmer_active: bool,
+    pub last_tray_wear: Option<Option<u8>>,
     pub _tray: Option<tray_icon::TrayIcon>,
     pub _show_id: Option<tray_icon::menu::MenuId>,
     pub _quit_id: Option<tray_icon::menu::MenuId>,
@@ -248,6 +249,7 @@ impl SsdWatchApp {
             gauge_anim_start: None,
             prev_anim_key: None,
             shimmer_active: false,
+            last_tray_wear: None,
             _tray: None,
             _show_id: None,
             _quit_id: None,
@@ -392,6 +394,20 @@ impl eframe::App for SsdWatchApp {
         let Some(snap) = self.take_snapshot() else {
             return;
         };
+
+        let max_wear = snap
+            .per_drive_snapshots
+            .values()
+            .map(|s| s.percent_used)
+            .max();
+        if self.last_tray_wear != Some(max_wear) {
+            self.last_tray_wear = Some(max_wear);
+            if let Some(ref tray) = self._tray
+                && let Ok(icon) = crate::app_core::build_tray_icon(max_wear)
+            {
+                let _ = tray.set_icon(Some(icon));
+            }
+        }
 
         let theme = theme::apply_theme(ui.ctx(), snap.settings.theme_mode);
 
