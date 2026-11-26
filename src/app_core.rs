@@ -33,6 +33,8 @@ pub struct Settings {
     pub drives: std::collections::HashMap<String, DriveConfig>,
     #[serde(default)]
     pub verbose_logging: bool,
+    #[serde(default)]
+    pub theme_mode: crate::theme::ThemeMode,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
             verbose_logging: false,
+            theme_mode: crate::theme::ThemeMode::default(),
         }
     }
 }
@@ -144,6 +147,7 @@ pub struct SharedState {
     pub rescan_requested: bool,
     pub is_logon_startup: bool,
     pub initialization_error: Option<String>,
+    pub egui_ctx: Option<egui::Context>,
 }
 
 impl SharedState {
@@ -175,6 +179,20 @@ impl SharedState {
             rescan_requested: false,
             is_logon_startup: false,
             initialization_error: None,
+            egui_ctx: None,
+        }
+    }
+
+    /// Stores the `egui::Context` so background threads can wake the UI on data updates.
+    pub fn set_egui_ctx(&mut self, ctx: egui::Context) {
+        self.egui_ctx = Some(ctx);
+    }
+
+    /// Marks shared state as changed and wakes the UI thread if an `egui::Context` is registered.
+    pub fn mark_data_changed(&mut self) {
+        self.data_changed = true;
+        if let Some(ref ctx) = self.egui_ctx {
+            ctx.request_repaint();
         }
     }
 
@@ -303,6 +321,74 @@ pub fn check_and_send_alert(
     Ok(false)
 }
 
+/// Builds a crisp 32x32 anti-aliased RGBA tray icon with a drive glyph and semantic health dot.
+pub fn build_tray_icon(wear_pct: Option<u8>) -> Result<tray_icon::Icon> {
+    let size = 32usize;
+    let mut rgba = vec![0u8; size * size * 4];
+
+    let health_dot: [u8; 3] = match wear_pct {
+        Some(w) if w >= 80 => [248, 113, 113], // health_red
+        Some(w) if w >= 50 => [251, 191, 36],  // health_amber
+        Some(_) => [52, 211, 153],             // health_green
+        None => [34, 211, 238],                // accent cyan
+    };
+
+    let bg = [22u8, 25, 32];
+    let border = [52u8, 59, 76];
+    let drive_fill = [226u8, 232, 240];
+    let accent = [34u8, 211, 238];
+
+    // Signed distance to rounded rectangle centered at (15.5, 15.5), half-size 14.5, radius 6.0
+    for y in 0..size {
+        for x in 0..size {
+            let px = x as f32 + 0.5;
+            let py = y as f32 + 0.5;
+            let cx = (px - 16.0).abs() - 8.5;
+            let cy = (py - 16.0).abs() - 8.5;
+            let dist = cx.max(0.0).hypot(cy.max(0.0)) + cx.max(cy).min(0.0) - 6.0;
+
+            let idx = (y * size + x) * 4;
+            if dist > 0.75 {
+                continue; // transparent outside
+            }
+
+            let alpha = ((0.75 - dist) / 1.5).clamp(0.0, 1.0);
+            let mut rgb = if dist > -1.0 { border } else { bg };
+
+            // Inner SSD silhouette (x: 8..24, y: 7..23)
+            if (8.0..=24.0).contains(&px) && (7.0..=23.0).contains(&py) {
+                let in_inner_cutout = (10.5..=21.5).contains(&px) && (9.5..=17.5).contains(&py);
+                let in_pins = (11.0..=21.0).contains(&px)
+                    && (20.5..=23.0).contains(&py)
+                    && ((px as i32) % 2 == 0);
+                if in_inner_cutout {
+                    rgb = accent;
+                } else if !in_pins {
+                    rgb = drive_fill;
+                }
+            }
+
+            // Semantic health status dot in bottom-right corner at (24.5, 24.5), radius 4.5
+            let dot_dist = (px - 24.5).hypot(py - 24.5);
+            if dot_dist <= 5.5 {
+                if dot_dist <= 4.0 {
+                    rgb = health_dot;
+                } else {
+                    rgb = bg; // dark halo for crisp contrast
+                }
+            }
+
+            rgba[idx] = rgb[0];
+            rgba[idx + 1] = rgb[1];
+            rgba[idx + 2] = rgb[2];
+            rgba[idx + 3] = (alpha * 255.0).round() as u8;
+        }
+    }
+
+    tray_icon::Icon::from_rgba(rgba, size as u32, size as u32)
+        .map_err(|e| anyhow::anyhow!("Failed to construct tray icon: {e}"))
+}
+
 /// Initializes the system tray icon with "Show" and "Quit" menu entries.
 pub fn init_tray() -> Result<(tray_icon::TrayIcon, tray_icon::menu::MenuId, tray_icon::menu::MenuId)> {
     let menu = tray_icon::menu::Menu::new();
@@ -315,22 +401,7 @@ pub fn init_tray() -> Result<(tray_icon::TrayIcon, tray_icon::menu::MenuId, tray
     menu.append(&show_item)?;
     menu.append(&quit_item)?;
 
-    let width = 16u32;
-    let height = 16u32;
-    let mut rgba = Vec::with_capacity((width * height * 4) as usize);
-    for y in 0..height {
-        for x in 0..width {
-            if x == 0 || x == width - 1 || y == 0 || y == height - 1 {
-                rgba.extend_from_slice(&[40, 40, 40, 255]); // border
-            } else if (4..=11).contains(&y) && (3..=12).contains(&x) {
-                rgba.extend_from_slice(&[41, 128, 185, 255]); // drive body
-            } else {
-                rgba.extend_from_slice(&[220, 220, 220, 255]); // background
-            }
-        }
-    }
-    let icon = tray_icon::Icon::from_rgba(rgba, width, height)
-        .map_err(|e| anyhow::anyhow!("Failed to construct tray icon: {e}"))?;
+    let icon = build_tray_icon(None)?;
 
     let tray = tray_icon::TrayIconBuilder::new()
         .with_menu(Box::new(menu))
@@ -416,7 +487,7 @@ pub fn init_app_environment(state: &AppState) {
         crate::logger::log_error(&err_msg);
         if let Ok(mut s) = state.lock() {
             s.initialization_error = Some(err_msg);
-            s.data_changed = true;
+            s.mark_data_changed();
         }
     }
 }
@@ -432,7 +503,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
                 && s.initialization_error.is_none()
             {
                 s.initialization_error = Some(err_msg);
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             return Err(e);
         }
@@ -489,7 +560,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
         s.top_processes_today = top_today;
         s.top_processes_7d = top_7d;
         s.top_processes_30d = top_30d;
-        s.data_changed = true;
+        s.mark_data_changed();
     }
 
     Ok(())
@@ -527,7 +598,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 s.resolved_smartctl_path = None;
                 s.smartctl_version = None;
                 s.last_raw_output = raw_out;
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             return false;
         }
@@ -638,7 +709,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 s.last_raw_output = crate::smart::get_last_raw_output();
                 s.active_device = active_dev;
                 s.last_raw_error = None;
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             has_drives
         }
@@ -650,7 +721,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 s.smartctl_version = version;
                 s.last_raw_output = crate::smart::get_last_raw_output();
                 s.last_raw_error = Some(raw_err);
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             false
         }
@@ -868,7 +939,7 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
                             s.top_processes_today = top_today;
                             s.top_processes_7d = top_7d;
                             s.top_processes_30d = top_30d;
-                            s.data_changed = true;
+                            s.mark_data_changed();
                         }
                     }
                 }
@@ -939,6 +1010,7 @@ mod tests {
             custom_smartctl_path: Some(test_smartctl_path),
             drives,
             verbose_logging: true,
+            theme_mode: crate::theme::ThemeMode::default(),
         };
 
         let json = serde_json::to_string(&s).unwrap();
@@ -1028,6 +1100,7 @@ mod tests {
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
             verbose_logging: false,
+            theme_mode: crate::theme::ThemeMode::default(),
         };
         let state = new_app_state(settings);
         let today = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();

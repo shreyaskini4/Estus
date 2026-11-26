@@ -1,3 +1,9 @@
 /target
 .cargo/
 *.pdb
+*.log
+*.db
+*.db-wal
+*.db-shm
+/dist
+RELEASE_NOTES.md

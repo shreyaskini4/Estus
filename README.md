@@ -30,6 +30,12 @@ Pre-built releases are available on the [GitHub Releases](https://github.com/shr
 
 ---
 
+## Screenshots
+
+> Screenshots of the redesigned Dark and Light UI (Dashboard wear gauge, 30-day write chart, Process share breakdown, and Diagnostics) will be added here after release packaging.
+
+---
+
 ## Features
 
 ### Drive Monitoring
@@ -67,7 +73,7 @@ Pre-built releases are available on the [GitHub Releases](https://github.com/shr
 
 ### NVMe SMART Metrics
 
-Estus queries `smartctl -j -a` every 10 minutes in the background.
+Estus queries `smartctl -j -a` every 5 minutes in the background (with additional snapshots on startup and exit).
 
 - **Data Units Written and Read** are read from the NVMe `nvme_smart_health_information_log`. Per the NVM Express specification, 1 Data Unit = 1,000 x 512 bytes = 512,000 bytes. Total host bytes:
 
@@ -111,14 +117,22 @@ $$\text{GB/Hour} = \frac{\text{Total Host Bytes Written}}{10^9 \times \text{Powe
 ```
 src/
   main.rs          Entry point, eframe init, tray orchestration, panic hook
+  theme.rs         Dark/Light/System tokens, vector AppIcon painter, widget helpers
   smart.rs         smartctl resolution, multi-drive discovery, SMART parsing
-  procs.rs         sysinfo process disk polling, PID reuse delta calculation
-  db.rs            SQLite storage (WAL mode), per-drive snapshots and deltas
+  procs.rs         sysinfo process disk polling, PID+start_time delta calculation
+  db.rs            SQLite storage (WAL mode), per-drive snapshots and intervals
   analytics.rs     Pure functions for write rates, lifespan, and thresholds
   app_core.rs      Background threads, tray icon, notifications, settings
-  ui.rs            egui dashboard, drive selector, 30-day plot, diagnostics
   logger.rs        Rotating file logger and crash formatting
   process_util.rs  Silent subprocess creation with CREATE_NO_WINDOW
+  ui/
+    mod.rs         App shell, UiSnapshot, formatting helpers, idle-CPU repaint contract
+    sidebar.rs     Collapsible drive rail, inline rename, view navigation
+    dashboard.rs   Animated wear arc gauge, stat tiles, 30-day chart
+    processes.rs   Searchable process table with proportional share bars
+    settings.rs    Grouped settings cards (Appearance, Alerts, Startup, Drives)
+    diagnostics.rs smartctl diagnostics, copyable raw output, 24h intervals CSV export
+    onboarding.rs  Setup onboarding, error banners, and loading skeleton shimmer
 ```
 
 ### Dependencies
