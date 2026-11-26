@@ -111,7 +111,7 @@ impl Theme {
             accent_on_fill: Color32::from_rgb(255, 255, 255),
             health_green: Color32::from_rgb(4, 120, 87),
             health_amber: Color32::from_rgb(180, 83, 9),
-            health_red: Color32::from_rgb(220, 38, 38),
+            health_red: Color32::from_rgb(198, 30, 30),
         }
     }
 

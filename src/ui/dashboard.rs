@@ -91,7 +91,7 @@ fn render_header(ui: &mut Ui, theme: &Theme, app: &mut SsdWatchApp, snap: &UiSna
         ("All Drives".to_string(), sub, AppIcon::DriveAll)
     };
 
-    ui.horizontal(|ui| {
+    ui.horizontal_wrapped(|ui| {
         let (icon_rect, _) = ui.allocate_exact_size(Vec2::splat(24.0), Sense::hover());
         theme::paint_icon(ui.painter(), icon_rect, icon, theme.accent_text);
         ui.add_space(SPACE_SM);
