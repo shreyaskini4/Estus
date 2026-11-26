@@ -9,6 +9,7 @@ pub mod process_util;
 pub mod procs;
 pub mod single_instance;
 pub mod smart;
+pub mod theme;
 pub mod ui;
 
 use std::sync::Arc;
@@ -60,8 +61,8 @@ fn main() -> eframe::Result<()> {
         viewport: egui::ViewportBuilder::default()
             .with_title("Estus")
             .with_visible(!start_minimized)
-            .with_inner_size([920.0, 740.0])
-            .with_min_inner_size([780.0, 520.0]),
+            .with_inner_size([1120.0, 740.0])
+            .with_min_inner_size([900.0, 600.0]),
         ..Default::default()
     };
 
@@ -71,6 +72,10 @@ fn main() -> eframe::Result<()> {
         "Estus",
         native_options,
         Box::new(move |cc| {
+            theme::configure_fonts(&cc.egui_ctx);
+            if let Ok(mut s) = state_for_ui.lock() {
+                s.set_egui_ctx(cc.egui_ctx.clone());
+            }
             let mut app = ui::EstusApp::new(Arc::clone(&state_for_ui));
 
             // Spawn activation event listener thread so external launches restore/focus this instance

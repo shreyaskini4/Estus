@@ -33,6 +33,8 @@ pub struct Settings {
     pub drives: std::collections::HashMap<String, DriveConfig>,
     #[serde(default)]
     pub verbose_logging: bool,
+    #[serde(default)]
+    pub theme_mode: crate::theme::ThemeMode,
 }
 
 impl Default for Settings {
@@ -44,6 +46,7 @@ impl Default for Settings {
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
             verbose_logging: false,
+            theme_mode: crate::theme::ThemeMode::default(),
         }
     }
 }
@@ -144,6 +147,7 @@ pub struct SharedState {
     pub rescan_requested: bool,
     pub is_logon_startup: bool,
     pub initialization_error: Option<String>,
+    pub egui_ctx: Option<egui::Context>,
 }
 
 impl SharedState {
@@ -175,6 +179,20 @@ impl SharedState {
             rescan_requested: false,
             is_logon_startup: false,
             initialization_error: None,
+            egui_ctx: None,
+        }
+    }
+
+    /// Stores the `egui::Context` so background threads can wake the UI on data updates.
+    pub fn set_egui_ctx(&mut self, ctx: egui::Context) {
+        self.egui_ctx = Some(ctx);
+    }
+
+    /// Marks shared state as changed and wakes the UI thread if an `egui::Context` is registered.
+    pub fn mark_data_changed(&mut self) {
+        self.data_changed = true;
+        if let Some(ref ctx) = self.egui_ctx {
+            ctx.request_repaint();
         }
     }
 
@@ -416,7 +434,7 @@ pub fn init_app_environment(state: &AppState) {
         crate::logger::log_error(&err_msg);
         if let Ok(mut s) = state.lock() {
             s.initialization_error = Some(err_msg);
-            s.data_changed = true;
+            s.mark_data_changed();
         }
     }
 }
@@ -432,7 +450,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
                 && s.initialization_error.is_none()
             {
                 s.initialization_error = Some(err_msg);
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             return Err(e);
         }
@@ -489,7 +507,7 @@ pub fn initialize_database_and_state(state: &AppState) -> Result<()> {
         s.top_processes_today = top_today;
         s.top_processes_7d = top_7d;
         s.top_processes_30d = top_30d;
-        s.data_changed = true;
+        s.mark_data_changed();
     }
 
     Ok(())
@@ -527,7 +545,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 s.resolved_smartctl_path = None;
                 s.smartctl_version = None;
                 s.last_raw_output = raw_out;
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             return false;
         }
@@ -638,7 +656,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 s.last_raw_output = crate::smart::get_last_raw_output();
                 s.active_device = active_dev;
                 s.last_raw_error = None;
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             has_drives
         }
@@ -650,7 +668,7 @@ pub fn poll_smart_cycle(state: &AppState) -> bool {
                 s.smartctl_version = version;
                 s.last_raw_output = crate::smart::get_last_raw_output();
                 s.last_raw_error = Some(raw_err);
-                s.data_changed = true;
+                s.mark_data_changed();
             }
             false
         }
@@ -868,7 +886,7 @@ pub fn spawn_procs_poller(state: AppState) -> std::thread::JoinHandle<()> {
                             s.top_processes_today = top_today;
                             s.top_processes_7d = top_7d;
                             s.top_processes_30d = top_30d;
-                            s.data_changed = true;
+                            s.mark_data_changed();
                         }
                     }
                 }
@@ -939,6 +957,7 @@ mod tests {
             custom_smartctl_path: Some(test_smartctl_path),
             drives,
             verbose_logging: true,
+            theme_mode: crate::theme::ThemeMode::default(),
         };
 
         let json = serde_json::to_string(&s).unwrap();
@@ -1028,6 +1047,7 @@ mod tests {
             custom_smartctl_path: None,
             drives: std::collections::HashMap::new(),
             verbose_logging: false,
+            theme_mode: crate::theme::ThemeMode::default(),
         };
         let state = new_app_state(settings);
         let today = NaiveDate::from_ymd_opt(2026, 11, 16).unwrap();
